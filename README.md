@@ -227,7 +227,7 @@ This is an educational/prototype implementation. For production use:
 
 ## 📧 Contact
 
-Project maintained by [VertikaJain](https://github.com/VertikaJain)
+Project maintained by [Parwaaz Joshi](https://github.com/joshi-parwaaz)
 
 ---
 
