@@ -26,6 +26,7 @@ A secure, privacy-focused messaging application built with the MERN stack (Mongo
 - **Conversation Requests** - Accept/reject conversation invitations
 - **Read Receipts** - Delivered and read status tracking
 - **Message Persistence** - Encrypted message storage with MongoDB
+   - New: Conversation history can be fetched from the server as ciphertext and decrypted client-side (see Message History below)
 - **Attachment Support** - GridFS encrypted file storage (backend ready)
 
 ### Cryptography
@@ -80,6 +81,16 @@ cd frontend && npm run dev
 ```
 
 Visit `http://localhost:5173` and create two accounts to start messaging!
+
+## Message History (client-side decrypt)
+
+CipherLink stores encrypted message envelopes in MongoDB and keeps the application zero-knowledge (the server never sees plaintext). Recent updates add the ability for the client to fetch conversation history from the server and decrypt it locally so message history persists after refresh:
+
+- Backend: `GET /api/messages/conversation/:convId` — returns ciphertext, nonce, AAD, messageNumber, and metadata for messages belonging to the requesting device's conversation (JWT-protected, membership validated, supports pagination).
+- Frontend: `apiClient.getConversationMessages(convId, limit?, offset?)` — new API helper that returns encrypted messages for a conversation.
+- Chat: On conversation load the client fetches recent encrypted messages, decrypts them locally using the existing Double Ratchet state (including stored skipped-message keys), and renders the plaintext locally. Failed decryptions are handled gracefully and reported to the server (NACK).
+
+This keeps the zero-knowledge guarantees while giving a persistent message history experience.
 
 ## 📚 Documentation
 
@@ -143,6 +154,15 @@ Visit `http://localhost:5173` and create two accounts to start messaging!
    - Initializes Double Ratchet (matching Alice's state)
 6. **Message Exchange** - Each message uses new key from ratchet chain
 7. **Forward Secrecy** - Old keys deleted after use
+
+
+## 📁 Meta/Config Folders
+
+- `.github/` – GitHub Actions, Copilot, and workflow configuration (ignored in .gitignore)
+- `.specify/` – Internal feature planning, scripts, and templates (ignored in .gitignore)
+- `.vscode/` – VS Code workspace settings (ignored in .gitignore except settings.json)
+
+These folders are ignored in version control for privacy and repo cleanliness.
 
 ## 📂 Project Structure
 

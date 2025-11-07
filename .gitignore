@@ -52,9 +52,9 @@ Desktop.ini
 .Spotlight-V100
 .Trashes
 
-# Editor directories and files
+
+# Editor and meta/config folders
 .vscode/*
-!.vscode/extensions.json
 !.vscode/settings.json
 .idea/
 *.suo
@@ -63,6 +63,8 @@ Desktop.ini
 *.sln
 *.sw?
 *.code-workspace
+.github/
+.specify/
 
 # Testing
 coverage/

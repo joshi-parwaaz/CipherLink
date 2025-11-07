@@ -200,6 +200,70 @@ export default function Chat() {
           }
         }
 
+        // ⚡ LOAD MESSAGE HISTORY FOR EACH CONVERSATION
+        const currentUserId = localStorage.getItem('userId');
+        for (const conv of sessionConversations) {
+          try {
+            console.log(`📜 Loading history for conversation: ${conv.id}`);
+            
+            // Fetch encrypted messages from server
+            const { messages: encryptedMessages } = await apiClient.getConversationMessages(
+              conv.id,
+              50  // Last 50 messages
+            );
+            
+            console.log(`📦 Fetched ${encryptedMessages.length} encrypted messages`);
+            
+            // Decrypt each message
+            const decryptedMessages: Message[] = [];
+            const currentDeviceId = localStorage.getItem('deviceId');
+            
+            for (const msg of encryptedMessages) {
+              try {
+                const messageForDecryption = {
+                  messageId: msg.messageId,
+                  conversationId: msg.convId,
+                  senderId: msg.fromUserId,
+                  ciphertext: msg.ciphertext,
+                  timestamp: new Date(msg.serverReceivedAt).toISOString(),
+                };
+                
+                const decrypted = await messagingService.receiveMessage(messageForDecryption);
+                
+                decryptedMessages.push({
+                  id: msg.messageId,
+                  senderId: msg.fromUserId,
+                  senderUsername: msg.fromUserId === currentUserId 
+                    ? currentUser.username 
+                    : conv.partnerUsername,
+                  plaintext: decrypted.plaintext,
+                  timestamp: new Date(msg.serverReceivedAt),
+                  status: msg.fromDeviceId === currentDeviceId ? 'sent' : 'delivered',
+                });
+                
+                console.log(`✅ Decrypted message: ${msg.messageId.substring(0, 8)}...`);
+              } catch (decryptErr) {
+                console.error(`❌ Failed to decrypt message ${msg.messageId}:`, decryptErr);
+                // Skip failed messages, don't break the loop
+              }
+            }
+            
+            // Add decrypted messages to conversation
+            conv.messages = decryptedMessages.sort((a, b) => 
+              a.timestamp.getTime() - b.timestamp.getTime()
+            );
+            
+            console.log(`✅ Loaded ${decryptedMessages.length}/${encryptedMessages.length} messages for ${conv.partnerUsername}`);
+          } catch (historyErr) {
+            console.error(`⚠️ Failed to load history for conversation ${conv.id}:`, historyErr);
+            // Continue with empty message array
+            conv.messages = [];
+          }
+        }
+        
+        // Update state with conversations including history
+        setConversations([...sessionConversations]);
+
         // ⚡ FETCH PENDING CONVERSATION REQUESTS
         try {
           const { pending } = await apiClient.getPendingConversationRequests();
@@ -292,7 +356,7 @@ export default function Chat() {
       realtimeClient.disconnect();
       clearInterval(pollInterval);
     };
-  }, [navigate, loading]); // Removed activeConversationId - caused re-initialization on click!
+  }, [navigate]); // Only re-run if navigate changes (which means component unmount)
 
   // Handle incoming messages
   useEffect(() => {
@@ -303,14 +367,19 @@ export default function Chat() {
       ciphertext: string;
       timestamp: string;
     }) => {
+      console.log('📬 handleIncomingMessage called with:', data);
       try {
         // Decrypt the message
+        console.log('🔓 Attempting to decrypt message...');
         const decrypted = await messagingService.receiveMessage(data);
+        console.log('✅ Message decrypted successfully:', decrypted);
 
         // ✅ Acknowledge successful decryption
         try {
           await apiClient.acknowledgeMessage(data.messageId);
+          console.log('✅ Message acknowledged');
         } catch (ackErr) {
+          console.error('⚠️ Failed to acknowledge message:', ackErr);
         }
 
         // Find or create conversation
@@ -318,6 +387,7 @@ export default function Chat() {
           const existing = prev.find((c) => c.id === data.conversationId);
 
           if (existing) {
+            console.log('📝 Adding message to existing conversation');
             // Add message to existing conversation
             const newMessage: Message = {
               id: data.messageId,
@@ -338,6 +408,7 @@ export default function Chat() {
                 : c
             );
           } else {
+            console.log('➕ Creating new conversation');
             // Create new conversation
             const session = messagingService.getSession(data.conversationId);
             const newConversation: Conversation = {
@@ -360,12 +431,16 @@ export default function Chat() {
             return [...prev, newConversation];
           }
         });
+        console.log('✅ Conversation state updated');
       } catch (err) {
+        console.error('❌ Error handling incoming message:', err);
         // ❌ Report decryption failure (NACK)
         try {
           const reason = err instanceof Error ? err.message : 'Unknown error';
           await apiClient.reportMessageFailure(data.messageId, reason);
+          console.log('📤 NACK sent for failed message');
         } catch (nackErr) {
+          console.error('⚠️ Failed to send NACK:', nackErr);
         }
       }
     };
@@ -852,34 +927,39 @@ export default function Chat() {
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {activeConversation.messages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`flex ${msg.senderId === currentUser?.id ? 'justify-end' : 'justify-start'}`}
-                >
+              {activeConversation.messages.map((msg) => {
+                const isMe = msg.senderId === currentUser?.id;
+                return (
                   <div
-                    className={`max-w-[70%] rounded p-3 ${
-                      msg.senderId === currentUser?.id
-                        ? 'bg-green-500/20 border border-green-500/30'
-                        : 'bg-green-950/30 border border-green-500/20'
-                    }`}
+                    key={msg.id}
+                    className={`flex w-full ${isMe ? 'justify-end' : 'justify-start'}`}
                   >
-                    <div className="text-sm text-green-400 font-mono">{msg.plaintext}</div>
-                    <div className="text-xs text-green-500/60 mt-2 flex items-center justify-between font-mono">
-                      <span>{msg.timestamp.toLocaleTimeString()}</span>
-                      {msg.senderId === currentUser?.id && (
-                        <span className="ml-2">
-                          {msg.status === 'sending' && '⏳'}
-                          {msg.status === 'sent' && '✓'}
-                          {msg.status === 'delivered' && '✓✓'}
-                          {msg.status === 'read' && '✓✓✓'}
-                          {msg.status === 'failed' && '❌'}
-                        </span>
-                      )}
+                    <div
+                      className={`max-w-[70%] rounded-lg p-3 shadow-md font-mono transition-all
+                        bg-zinc-900/80 border border-green-900/40 text-green-200 rounded-bl-none
+                      `}
+                      style={{
+                        borderTopRightRadius: isMe ? 0 : undefined,
+                        borderTopLeftRadius: !isMe ? 0 : undefined,
+                      }}
+                    >
+                      <div className="text-sm break-words">{msg.plaintext}</div>
+                      <div className="text-xs text-green-500/60 mt-2 flex items-center justify-between">
+                        <span>{msg.timestamp.toLocaleTimeString()}</span>
+                        {isMe && (
+                          <span className="ml-2">
+                            {msg.status === 'sending' && '⏳'}
+                            {msg.status === 'sent' && '✓'}
+                            {msg.status === 'delivered' && '✓✓'}
+                            {msg.status === 'read' && '✓✓✓'}
+                            {msg.status === 'failed' && '❌'}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             {/* Message Input */}

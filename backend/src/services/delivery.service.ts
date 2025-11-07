@@ -79,7 +79,13 @@ export async function deliverMessage(
 
   // Emit WebSocket event to each recipient device
   envelope.toDeviceIds.forEach((deviceId) => {
-    io?.to(`device:${deviceId}`).emit('message:new', {
+    const room = `device:${deviceId}`;
+    logger.info(
+      { deviceId, room, messageId: message.messageId },
+      'Attempting to emit message:new to room'
+    );
+    
+    io?.to(room).emit('message:new', {
       messageId: message.messageId,
       convId: message.convId,
       fromUserId: message.fromUserId,

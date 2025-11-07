@@ -17,9 +17,21 @@ export function setupSocket(httpServer: HTTPServer): SocketIOServer {
     socket.on('register', (data: { userId: string; deviceId: string }) => {
       const { userId, deviceId } = data;
       if (userId && deviceId) {
-        socket.join(`user:${userId}`);
-        socket.join(`device:${deviceId}`);
-        logger.info({ socketId: socket.id, userId, deviceId }, 'Client registered for notifications');
+        const userRoom = `user:${userId}`;
+        const deviceRoom = `device:${deviceId}`;
+        socket.join(userRoom);
+        socket.join(deviceRoom);
+        logger.info(
+          { 
+            socketId: socket.id, 
+            userId, 
+            deviceId,
+            rooms: [userRoom, deviceRoom]
+          }, 
+          'Client registered for notifications - joined rooms'
+        );
+      } else {
+        logger.warn({ socketId: socket.id, data }, 'Invalid register data - missing userId or deviceId');
       }
     });
 

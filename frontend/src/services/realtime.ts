@@ -59,13 +59,16 @@ class RealtimeClient {
     });
 
     this.socket.on('connect', () => {
+      console.log('✅ WebSocket connected');
       // Register device to receive messages
       const userId = localStorage.getItem('userId');
       const deviceId = localStorage.getItem('deviceId');
       
       if (userId && deviceId) {
+        console.log('📡 Registering device:', { userId, deviceId });
         this.socket?.emit('register', { userId, deviceId });
       } else {
+        console.error('❌ Cannot register: missing userId or deviceId');
       }
       
       this.connectHandlers.forEach((handler) => handler());
@@ -76,6 +79,7 @@ class RealtimeClient {
     });
 
     this.socket.on('message:new', (data) => {
+      console.log('🔔 WebSocket received message:new event:', data);
       // Map backend field names to frontend expectations
       const mappedData = {
         messageId: data.messageId,
@@ -87,6 +91,8 @@ class RealtimeClient {
         messageNumber: data.messageNumber,    // CRITICAL: needed for ratchet
         timestamp: data.serverReceivedAt,     // Backend sends "serverReceivedAt"
       };
+      console.log('📨 Mapped data:', mappedData);
+      console.log('👂 Active message handlers:', this.messageHandlers.size);
       this.messageHandlers.forEach((handler) => handler(mappedData));
     });
 

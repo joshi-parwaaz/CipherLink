@@ -279,6 +279,42 @@ class APIClient {
     await this.client.post('/messages/nack', { messageId, reason });
   }
 
+  /**
+   * Get message history for a conversation (encrypted)
+   * Returns all messages (pending, delivered, etc.) for persistent history
+   */
+  async getConversationMessages(
+    convId: string,
+    limit: number = 100,
+    offset: number = 0
+  ): Promise<{
+    messages: Array<{
+      messageId: string;
+      convId: string;
+      fromUserId: string;
+      fromDeviceId: string;
+      ciphertext: string;
+      nonce: string;
+      aad: {
+        senderId: string;
+        recipientIds: string[];
+        ts: Date;
+      };
+      messageNumber?: number;
+      sentAt: Date;
+      serverReceivedAt: Date;
+      status: string;
+    }>;
+    total: number;
+    hasMore: boolean;
+  }> {
+    const response = await this.client.get(
+      `/messages/conversation/${convId}`,
+      { params: { limit, offset } }
+    );
+    return response.data;
+  }
+
   // ========== Devices (to be implemented in Phase 4) ==========
 
   async getDevices(userId: string): Promise<

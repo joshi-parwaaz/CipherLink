@@ -1,4 +1,13 @@
+
 # CipherLink - Technical Documentation
+
+## Note on Meta/Config Folders
+
+- `.github/` – GitHub Actions, Copilot, and workflow configuration (ignored in .gitignore)
+- `.specify/` – Internal feature planning, scripts, and templates (ignored in .gitignore)
+- `.vscode/` – VS Code workspace settings (ignored in .gitignore except settings.json)
+
+These folders are ignored in version control for privacy and repo cleanliness.
 
 Comprehensive technical documentation of the CipherLink end-to-end encrypted messaging platform.
 
@@ -864,6 +873,63 @@ Fetch pending messages for device (polling).
 ```
 
 #### POST /api/messages/:messageId/ack
+#### GET /api/messages/conversation/:convId
+Get encrypted message history for a conversation.
+
+Auth: Required (JWT)
+
+Query params:
+- `limit` (number, optional) — maximum messages to return (default 100)
+- `offset` (number, optional) — pagination offset
+
+Response (200):
+```json
+{
+  "messages": [
+    {
+      "messageId": "uuid",
+      "convId": "uuid",
+      "fromUserId": "uuid",
+      "fromDeviceId": "uuid",
+      "ciphertext": "base64",
+      "nonce": "base64",
+      "aad": { /* senderId/recipientIds/ts */ },
+      "messageNumber": 1,
+      "sentAt": "...",
+      "serverReceivedAt": "...",
+      "status": "delivered"
+    }
+  ],
+  "total": 42,
+  "hasMore": false
+}
+```
+
+Notes:
+- The endpoint verifies the requesting user is a member of the conversation and that the messages returned are relevant to the requesting device (toDeviceIds/fromDeviceId match). Only ciphertext and metadata are returned; the server never has access to plaintext.
+- Use pagination for large histories.
+
+### Frontend: history API and chat loading
+
+- `apiClient.getConversationMessages(convId, limit?, offset?)` — new helper that calls the endpoint above and returns the encrypted messages object.
+- `Chat.tsx` now loads recent history after session initialization. For each conversation the client:
+  1. Calls `getConversationMessages()` to fetch encrypted envelopes
+  2. Calls `messagingService.receiveMessage()` for each envelope – this will attempt to decrypt using the stored ratchet state and skipped-message keys
+  3. Successful decrypts are inserted into the UI; failed decrypts are reported with a NACK and skipped
+
+### Ratchet persistence and skipped-message keys
+
+The Double Ratchet implementation persists `skippedMessageKeys` in the serialized ratchet state saved to localStorage. The serialization converts the Map of skipped keys into a stable array so keys survive page reloads. This enables decrypting already-delivered messages after a refresh as long as the session is present in localStorage.
+
+Key points:
+- `skippedMessageKeys` format: key = `"ratchetPublicKey:messageNumber"` → value = base64 message key
+- The ratchet state is saved as `session_${conversationId}` in localStorage; the app has a storage version key `cipherlink_storage_version` and will auto-clear sessions if the version mismatches to avoid incompatible state.
+
+### Optional: IndexedDB message cache
+
+An optional `messageCache` (IndexedDB via `idb`) was sketched to cache decrypted messages locally for performance. If enabled, the client can use cached plaintext for quick UI rendering and fall back to server fetch+decrypt for verification.
+
+Security note: IndexedDB stores plaintext on the client; if you enable a cache, consider encrypting the cache or clearing it on logout.
 Acknowledge message delivery.
 
 **Auth**: Required

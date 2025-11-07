@@ -38,14 +38,89 @@ class MessagingService {
   async initialize(_userId: string): Promise<void> {
     await initCrypto();
     
-    // Clean invalid sessions before loading
-    const stats = getSessionStats();
+    // Check storage version and clear if mismatched
+    this.checkStorageVersion();
     
-    if (stats.invalid > 0) {
-      cleanInvalidSessions();
-    }
+    // Validate sessions against backend
+    await this.validateAndCleanSessions();
     
     this.loadSessionsFromStorage();
+  }
+
+  /**
+   * Check storage version and clear if mismatched
+   * This prevents issues when storage format changes
+   */
+  private checkStorageVersion(): void {
+    const CURRENT_VERSION = '1.0.0';
+    const storedVersion = localStorage.getItem('cipherlink_storage_version');
+    
+    if (!storedVersion || storedVersion !== CURRENT_VERSION) {
+      console.warn(`🔄 Storage version mismatch (stored: ${storedVersion}, current: ${CURRENT_VERSION})`);
+      console.log('🧹 Clearing all sessions to prevent compatibility issues...');
+      
+      // Clear all session data
+      const keys = Object.keys(localStorage);
+      keys.filter(k => k.startsWith('session_')).forEach(k => localStorage.removeItem(k));
+      
+      // Set new version
+      localStorage.setItem('cipherlink_storage_version', CURRENT_VERSION);
+      console.log('✅ Storage version updated');
+    }
+  }
+
+  /**
+   * Validate sessions against backend conversations
+   * Clear sessions for conversations that no longer exist
+   */
+  private async validateAndCleanSessions(): Promise<void> {
+    try {
+      console.log('🔍 Validating sessions against backend...');
+      
+      // Get all sessions from localStorage
+      const sessionKeys = Object.keys(localStorage).filter(k => k.startsWith('session_'));
+      if (sessionKeys.length === 0) {
+        console.log('✅ No sessions to validate');
+        return;
+      }
+
+      // Clean structurally invalid sessions first
+      const stats = getSessionStats();
+      if (stats.invalid > 0) {
+        console.log(`🗑️ Removing ${stats.invalid} structurally invalid session(s)`);
+        cleanInvalidSessions();
+      }
+
+      // Fetch all conversations from backend
+      const { conversations } = await apiClient.getConversations();
+      const validConvIds = new Set(conversations.map(c => c.convId));
+      
+      console.log(`📊 Backend has ${validConvIds.size} conversations, localStorage has ${sessionKeys.length} sessions`);
+
+      // Check each session
+      const updatedSessionKeys = Object.keys(localStorage).filter(k => k.startsWith('session_'));
+      let removedCount = 0;
+      
+      for (const key of updatedSessionKeys) {
+        const convId = key.replace('session_', '');
+        
+        // If conversation doesn't exist on backend, remove the session
+        if (!validConvIds.has(convId)) {
+          console.log(`🗑️ Removing orphaned session: ${convId}`);
+          localStorage.removeItem(key);
+          removedCount++;
+        }
+      }
+
+      if (removedCount > 0) {
+        console.log(`✅ Cleaned ${removedCount} orphaned session(s)`);
+      } else {
+        console.log('✅ All sessions match backend conversations');
+      }
+    } catch (err) {
+      console.error('⚠️ Failed to validate sessions:', err);
+      // Don't throw - allow app to continue with existing sessions
+    }
   }
 
   /**
@@ -377,8 +452,14 @@ class MessagingService {
     };
 
     // Send to server
+    console.log('📤 Sending message to server:', {
+      messageId,
+      convId: conversationId,
+      toDeviceIds: messageData.toDeviceIds,
+      recipientCount: messageData.toDeviceIds.length
+    });
     const response = await apiClient.sendMessage(messageData);
-
+    console.log('✅ Message sent successfully:', response);
 
     return {
       messageId: response.messageId,
@@ -402,7 +483,12 @@ class MessagingService {
     senderId: string;
     timestamp: Date;
   }> {
-
+    console.log('📨 receiveMessage called:', {
+      messageId: data.messageId,
+      conversationId: data.conversationId,
+      senderId: data.senderId,
+      ciphertextLength: data.ciphertext.length
+    });
     
     // Parse ciphertext envelope
     let envelope: EncryptedEnvelope;
@@ -410,7 +496,7 @@ class MessagingService {
 
     try {
       const parsed = JSON.parse(data.ciphertext);
-
+      console.log('📦 Parsed ciphertext envelope');
       
       // Envelope is already in base64 string format (matches EncryptedEnvelope interface)
       envelope = {
@@ -426,23 +512,27 @@ class MessagingService {
         ephemeralKey: parsed.header.ephemeralKey, // May be undefined
         senderIdentityKey: parsed.header.senderIdentityKey, // May be undefined
       };
+      console.log('📋 Header:', { messageNumber: header.messageNumber, hasEphemeralKey: !!header.ephemeralKey });
 
     } catch (err) {
-
-
+      console.error('❌ Failed to parse ciphertext:', err);
       throw new Error('Invalid ciphertext format');
     }
 
     // Get or create session
     let session = this.sessions.get(data.conversationId);
-
+    console.log('🔍 Session lookup:', { 
+      conversationId: data.conversationId, 
+      sessionExists: !!session 
+    });
 
     if (!session) {
+      console.log('🆕 No session found - initializing as Bob (receiver)');
       // This is the first message from partner (we're Bob)
-
       
       // Check if this is a first message with X3DH data
       if (!header.ephemeralKey || !header.senderIdentityKey) {
+        console.error('❌ Missing X3DH data in first message');
         throw new Error('First message must include X3DH ephemeral key and sender identity');
       }
       
@@ -452,24 +542,38 @@ class MessagingService {
         header.ephemeralKey,
         header.senderIdentityKey
       );
+      console.log('✅ Session initialized as Bob');
     }
 
     // Decrypt using Double Ratchet
+    console.log('🔓 Decrypting with Double Ratchet...');
+    
+    try {
+      const plaintextBytes = ratchetDecrypt(session.ratchetState, envelope, header);
+      const plaintext = sodium.to_string(plaintextBytes);
+      console.log('✅ Message decrypted successfully:', plaintext.substring(0, 50) + '...');
 
-    const plaintextBytes = ratchetDecrypt(session.ratchetState, envelope, header);
-    const plaintext = sodium.to_string(plaintextBytes);
+      // Update session
+      session.lastUsedAt = new Date();
+      this.saveSessionToStorage(session);
+      console.log('💾 Session updated and saved');
 
-    // Update session
-    session.lastUsedAt = new Date();
-    this.saveSessionToStorage(session);
-
-
-    return {
-      messageId: data.messageId,
-      plaintext,
-      senderId: data.senderId,
-      timestamp: new Date(data.timestamp),
-    };
+      return {
+        messageId: data.messageId,
+        plaintext,
+        senderId: data.senderId,
+        timestamp: new Date(data.timestamp),
+      };
+    } catch (decryptErr) {
+      console.error('❌ Ratchet decryption failed:', decryptErr);
+      
+      // If decryption fails, the ratchet state is out of sync
+      // This usually means the session is corrupted
+      console.warn('⚠️ Ratchet state mismatch detected - removing corrupted session');
+      this.deleteSession(data.conversationId);
+      
+      throw new Error('Ratchet state mismatch - session has been reset. Please ask your contact to send the message again.');
+    }
   }
 
   /**
@@ -524,12 +628,12 @@ class MessagingService {
     // Fetch partner username
     let partnerUsername = 'Unknown';
     try {
-      const devices = await apiClient.getDevices(partnerId);
-      if (devices && devices.length > 0) {
-        partnerUsername = devices[0].name || partnerId; // Use device name or userId as fallback
-      }
+      const user = await apiClient.getUserById(partnerId);
+      partnerUsername = user.username;
     } catch (err) {
-
+      console.warn('Failed to fetch partner username:', err);
+      // Fallback to userId
+      partnerUsername = partnerId;
     }
 
     const session: ConversationSession = {
