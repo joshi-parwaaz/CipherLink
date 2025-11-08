@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../services/api';
 import { messagingService } from '../../services/messaging';
@@ -41,7 +41,10 @@ export default function Chat() {
   const [pendingRequests, setPendingRequests] = useState<PendingRequest[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [messageInput, setMessageInput] = useState('');
+  const [_processedMessageIds, setProcessedMessageIds] = useState<Set<string>>(new Set());
+  const processedMessageIdsRef = useRef<Set<string>>(new Set());
   const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
 
   // Get active conversation
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
@@ -75,14 +78,19 @@ export default function Chat() {
 
         // Load existing sessions from localStorage
         const sessions = messagingService.getAllSessions();
-        const sessionConversations: Conversation[] = sessions.map((session) => ({
-          id: session.conversationId,
-          partnerId: session.partnerId,
-          partnerUsername: session.partnerUsername,
-          messages: [],
-          unreadCount: 0,
-          status: 'accepted' as const, // Sessions in storage are already accepted
-        }));
+        const conversationMap = new Map<string, Conversation>();
+
+        // Add conversations from sessions first
+        sessions.forEach((session) => {
+          conversationMap.set(session.conversationId, {
+            id: session.conversationId,
+            partnerId: session.partnerId,
+            partnerUsername: session.partnerUsername,
+            messages: [],
+            unreadCount: 0,
+            status: 'accepted' as const, // Sessions in storage are already accepted
+          });
+        });
 
         // Fetch all conversations from backend to get pending requests we initiated
         try {
@@ -90,8 +98,8 @@ export default function Chat() {
           const userId = localStorage.getItem('userId');
           // Process backend conversations
           for (const conv of backendConvs) {
-            // Skip if we already have this conversation from sessions
-            if (sessionConversations.find(c => c.id === conv.convId)) {
+            // Skip if we already have this conversation
+            if (conversationMap.has(conv.convId)) {
               continue;
             }
 
@@ -101,32 +109,55 @@ export default function Chat() {
               continue;
             }
 
-            // Get partner info (the other member who isn't us)
-            const partnerId = conv.memberUserIds.find(id => id !== userId);
-            if (!partnerId) {
-              continue;
+            // For accepted conversations, add them if we don't have them
+            if (conv.status === 'accepted') {
+              // Get partner info
+              const partnerId = conv.memberUserIds.find(id => id !== userId);
+              if (!partnerId || partnerId === userId) continue;
+
+              // Fetch partner username
+              let partnerUsername = partnerId;
+              try {
+                const partnerUser = await apiClient.getUserById(partnerId);
+                partnerUsername = partnerUser.username;
+              } catch (err) {}
+
+              conversationMap.set(conv.convId, {
+                id: conv.convId,
+                partnerId,
+                partnerUsername,
+                messages: [],
+                unreadCount: 0,
+                status: 'accepted',
+              });
             }
 
-            // Fetch partner username by user ID
-            let partnerUsername = partnerId; // Fallback to ID
-            try {
-              const partnerUser = await apiClient.getUserById(partnerId);
-              partnerUsername = partnerUser.username;
-            } catch (err) {
+            // For pending conversations we initiated
+            if (conv.status === 'pending' && conv.initiatorUserId === userId) {
+              // Get partner info
+              const partnerId = conv.memberUserIds.find(id => id !== userId);
+              if (!partnerId || partnerId === userId) continue;
+
+              // Fetch partner username
+              let partnerUsername = partnerId;
+              try {
+                const partnerUser = await apiClient.getUserById(partnerId);
+                partnerUsername = partnerUser.username;
+              } catch (err) {}
+
+              conversationMap.set(conv.convId, {
+                id: conv.convId,
+                partnerId,
+                partnerUsername,
+                messages: [],
+                unreadCount: 0,
+                status: 'pending',
+              });
             }
-            // Add conversation to list
-            sessionConversations.push({
-              id: conv.convId,
-              partnerId,
-              partnerUsername,
-              messages: [],
-              unreadCount: 0,
-              status: conv.status,
-            });
           }
         } catch (err) {
         }
-        setConversations(sessionConversations);
+        setConversations(Array.from(conversationMap.values()));
 
         // ⚡ FETCH PENDING MESSAGES FROM SERVER
         const deviceId = localStorage.getItem('deviceId');
@@ -152,13 +183,32 @@ export default function Chat() {
                   timestamp: new Date(msg.serverReceivedAt).toISOString(),
                 };
 
+                // Check if message has already been processed
+                if (processedMessageIdsRef.current.has(msg.messageId)) {
+                  console.log('[initial] Skipping duplicate message:', msg.messageId);
+                  continue;
+                }
+
                 // Decrypt the message
                 const decrypted = await messagingService.receiveMessage(messageForDecryption);
 
+                // Skip self-sent echoes (they return empty plaintext)
+                if (decrypted.plaintext === '') {
+                  console.log('[initial] Skipping self-sent message echo');
+                  continue;
+                }
+
+                // Mark message as processed
+                processedMessageIdsRef.current.add(msg.messageId);
+                setProcessedMessageIds(prev => new Set(prev).add(msg.messageId));
+
                 // ✅ Acknowledge successful decryption
                 try {
-                  await apiClient.acknowledgeMessage(msg.messageId);
+                  console.log('[initial] Sending ACK for message:', msg.messageId);
+                  realtimeClient.acknowledgeMessage(msg.messageId);
+                  console.log('[initial] ACK sent successfully');
                 } catch (ackErr) {
+                  console.error('[initial] ACK failed:', ackErr);
                 }
 
                 // Add to conversations
@@ -191,7 +241,7 @@ export default function Chat() {
                 // ❌ Report decryption failure (NACK)
                 try {
                   const reason = decryptErr instanceof Error ? decryptErr.message : 'Unknown error';
-                  await apiClient.reportMessageFailure(msg.messageId, reason);
+                  realtimeClient.reportMessageFailure(msg.messageId, reason);
                 } catch (nackErr) {
                 }
               }
@@ -200,75 +250,13 @@ export default function Chat() {
           }
         }
 
-        // ⚡ LOAD MESSAGE HISTORY FOR EACH CONVERSATION
-        const currentUserId = localStorage.getItem('userId');
-        for (const conv of sessionConversations) {
-          try {
-            console.log(`📜 Loading history for conversation: ${conv.id}`);
-            
-            // Fetch encrypted messages from server
-            const { messages: encryptedMessages } = await apiClient.getConversationMessages(
-              conv.id,
-              50  // Last 50 messages
-            );
-            
-            console.log(`📦 Fetched ${encryptedMessages.length} encrypted messages`);
-            
-            // Decrypt each message
-            const decryptedMessages: Message[] = [];
-            const currentDeviceId = localStorage.getItem('deviceId');
-            
-            for (const msg of encryptedMessages) {
-              try {
-                const messageForDecryption = {
-                  messageId: msg.messageId,
-                  conversationId: msg.convId,
-                  senderId: msg.fromUserId,
-                  ciphertext: msg.ciphertext,
-                  timestamp: new Date(msg.serverReceivedAt).toISOString(),
-                };
-                
-                const decrypted = await messagingService.receiveMessage(messageForDecryption);
-                
-                decryptedMessages.push({
-                  id: msg.messageId,
-                  senderId: msg.fromUserId,
-                  senderUsername: msg.fromUserId === currentUserId 
-                    ? currentUser.username 
-                    : conv.partnerUsername,
-                  plaintext: decrypted.plaintext,
-                  timestamp: new Date(msg.serverReceivedAt),
-                  status: msg.fromDeviceId === currentDeviceId ? 'sent' : 'delivered',
-                });
-                
-                console.log(`✅ Decrypted message: ${msg.messageId.substring(0, 8)}...`);
-              } catch (decryptErr) {
-                console.error(`❌ Failed to decrypt message ${msg.messageId}:`, decryptErr);
-                // Skip failed messages, don't break the loop
-              }
-            }
-            
-            // Add decrypted messages to conversation
-            conv.messages = decryptedMessages.sort((a, b) => 
-              a.timestamp.getTime() - b.timestamp.getTime()
-            );
-            
-            console.log(`✅ Loaded ${decryptedMessages.length}/${encryptedMessages.length} messages for ${conv.partnerUsername}`);
-          } catch (historyErr) {
-            console.error(`⚠️ Failed to load history for conversation ${conv.id}:`, historyErr);
-            // Continue with empty message array
-            conv.messages = [];
-          }
-        }
-        
-        // Update state with conversations including history
-        setConversations([...sessionConversations]);
-
         // ⚡ FETCH PENDING CONVERSATION REQUESTS
         try {
           const { pending } = await apiClient.getPendingConversationRequests();
+          console.log('[Chat] Fetched pending requests:', pending);
           setPendingRequests(pending);
         } catch (fetchErr) {
+          console.error('[Chat] Failed to fetch pending requests:', fetchErr);
         }
 
         setLoading(false);
@@ -286,11 +274,15 @@ export default function Chat() {
         try {
           const pendingMessages = await apiClient.getPendingMessages(deviceId);
           if (pendingMessages.length > 0) {
+            console.log('[polling] Found pending messages:', pendingMessages.length);
             // Process messages same way as initial fetch
             for (const msg of pendingMessages) {
               try {
                 const session = messagingService.getSession(msg.convId);
-                if (!session) continue;
+                if (!session) {
+                  // For recipients, session might not exist yet - try to process anyway
+                  // receiveMessage will handle session creation for Bob
+                }
 
                 // The ciphertext from server is now already in the correct JSON format
                 const messageForDecryption = {
@@ -301,12 +293,31 @@ export default function Chat() {
                   timestamp: new Date(msg.serverReceivedAt).toISOString(),
                 };
 
+                // Check if message has already been processed
+                if (processedMessageIdsRef.current.has(msg.messageId)) {
+                  console.log('[polling] Skipping duplicate message:', msg.messageId);
+                  continue;
+                }
+
                 const decrypted = await messagingService.receiveMessage(messageForDecryption);
+
+                // Skip self-sent echoes (they return empty plaintext)
+                if (decrypted.plaintext === '') {
+                  console.log('[polling] Skipping self-sent message echo');
+                  continue;
+                }
+
+                // Mark message as processed
+                processedMessageIdsRef.current.add(msg.messageId);
+                setProcessedMessageIds(prev => new Set(prev).add(msg.messageId));
 
                 // ✅ Acknowledge successful decryption
                 try {
-                  await apiClient.acknowledgeMessage(msg.messageId);
+                  console.log('[polling] Sending ACK for message:', msg.messageId);
+                  realtimeClient.acknowledgeMessage(msg.messageId);
+                  console.log('[polling] ACK sent successfully');
                 } catch (ackErr) {
+                  console.error('[polling] ACK failed:', ackErr);
                 }
 
                 setConversations((prev) => {
@@ -341,7 +352,7 @@ export default function Chat() {
                 // ❌ Report decryption failure (NACK)
                 try {
                   const reason = err instanceof Error ? err.message : 'Unknown error';
-                  await apiClient.reportMessageFailure(msg.messageId, reason);
+                  realtimeClient.reportMessageFailure(msg.messageId, reason);
                 } catch (nackErr) {
                 }
               }
@@ -356,7 +367,22 @@ export default function Chat() {
       realtimeClient.disconnect();
       clearInterval(pollInterval);
     };
-  }, [navigate]); // Only re-run if navigate changes (which means component unmount)
+  }, [navigate, loading]); // Removed activeConversationId - caused re-initialization on click!
+
+  // Join conversation room when active conversation changes
+  useEffect(() => {
+    if (activeConversationId) {
+      realtimeClient.joinConversation(activeConversationId);
+      console.log('[Chat] Joined conversation room:', activeConversationId);
+    }
+
+    return () => {
+      if (activeConversationId) {
+        realtimeClient.leaveConversation(activeConversationId);
+        console.log('[Chat] Left conversation room:', activeConversationId);
+      }
+    };
+  }, [activeConversationId]);
 
   // Handle incoming messages
   useEffect(() => {
@@ -367,80 +393,133 @@ export default function Chat() {
       ciphertext: string;
       timestamp: string;
     }) => {
-      console.log('📬 handleIncomingMessage called with:', data);
+      console.log('[websocket] Processing message:', data.messageId, {
+        conversationId: data.conversationId,
+        senderId: data.senderId,
+        ciphertextLength: data.ciphertext.length,
+        timestamp: data.timestamp
+      });
+
+      // Check if message has already been processed
+      if (processedMessageIdsRef.current.has(data.messageId)) {
+        console.log('[websocket] Skipping duplicate message:', data.messageId);
+        return;
+      }
+
       try {
-        // Decrypt the message
-        console.log('🔓 Attempting to decrypt message...');
+        console.log('[websocket] Calling receiveMessage...');
         const decrypted = await messagingService.receiveMessage(data);
-        console.log('✅ Message decrypted successfully:', decrypted);
+        console.log('[websocket] Message decrypted successfully:', decrypted.messageId, {
+          plaintextLength: decrypted.plaintext.length,
+          senderId: decrypted.senderId
+        });
+
+        // Skip self-sent echoes (they return empty plaintext)
+        if (decrypted.plaintext === '') {
+          console.log('[websocket] Skipping self-sent message echo');
+          return;
+        }
+
+        // Mark message as processed
+        processedMessageIdsRef.current.add(data.messageId);
+        setProcessedMessageIds(prev => new Set(prev).add(data.messageId));
 
         // ✅ Acknowledge successful decryption
         try {
-          await apiClient.acknowledgeMessage(data.messageId);
-          console.log('✅ Message acknowledged');
+          console.log('[websocket] Sending ACK...');
+          realtimeClient.acknowledgeMessage(data.messageId);
+          console.log('[websocket] ACK sent');
         } catch (ackErr) {
-          console.error('⚠️ Failed to acknowledge message:', ackErr);
+          console.error('[websocket] ACK failed:', ackErr);
         }
 
+        console.log('[websocket] Updating conversations...');
         // Find or create conversation
         setConversations((prev) => {
           const existing = prev.find((c) => c.id === data.conversationId);
+          console.log('[websocket] Existing conversation found:', !!existing);
 
           if (existing) {
-            console.log('📝 Adding message to existing conversation');
-            // Add message to existing conversation
+            const existingMessageIndex = existing.messages.findIndex(m => m.id === data.messageId);
             const newMessage: Message = {
               id: data.messageId,
               senderId: data.senderId,
               senderUsername: existing.partnerUsername,
               plaintext: decrypted.plaintext,
-              timestamp: decrypted.timestamp,
+              timestamp: new Date(data.timestamp),
               status: 'delivered',
             };
 
-            return prev.map((c) =>
-              c.id === data.conversationId
-                ? {
-                    ...c,
-                    messages: [...c.messages, newMessage],
-                    unreadCount: c.id === activeConversationId ? 0 : c.unreadCount + 1,
-                  }
-                : c
-            );
+            return prev.map(conv => {
+              if (conv.id !== data.conversationId) return conv;
+
+              let updatedMessages;
+              if (existingMessageIndex !== -1) {
+                console.debug('[websocket] Updating existing message:', data.messageId);
+                updatedMessages = conv.messages.map(m =>
+                  m.id === data.messageId ? { ...m, ...newMessage } : m
+                );
+              } else {
+                console.debug('[websocket] Appending new decrypted message:', data.messageId);
+                updatedMessages = [...conv.messages, newMessage];
+              }
+
+              console.log('[Chat] Message added/updated:', data.messageId);
+              console.log('[Chat] Conversation message count:', updatedMessages.length);
+
+              return {
+                ...conv,
+                messages: updatedMessages,
+                unreadCount: conv.id === activeConversationId ? 0 : conv.unreadCount + 1,
+              };
+            });
           } else {
-            console.log('➕ Creating new conversation');
-            // Create new conversation
+            // Create new conversation (only if it doesn't exist)
+            console.log('[websocket] Creating new conversation');
             const session = messagingService.getSession(data.conversationId);
+            const newMessage: Message = {
+              id: data.messageId,
+              senderId: data.senderId,
+              senderUsername: session?.partnerUsername || 'Unknown',
+              plaintext: decrypted.plaintext,
+              timestamp: decrypted.timestamp,
+              status: 'delivered',
+            };
             const newConversation: Conversation = {
               id: data.conversationId,
               partnerId: data.senderId,
               partnerUsername: session?.partnerUsername || 'Unknown',
-              messages: [
-                {
-                  id: data.messageId,
-                  senderId: data.senderId,
-                  senderUsername: session?.partnerUsername || 'Unknown',
-                  plaintext: decrypted.plaintext,
-                  timestamp: decrypted.timestamp,
-                  status: 'delivered',
-                },
-              ],
+              messages: [newMessage],
               unreadCount: 1,
             };
 
+            // Check if conversation already exists (prevent duplicates from initialization)
+            const conversationExists = prev.some((c) => c.id === data.conversationId);
+            if (conversationExists) {
+              console.log('[websocket] Conversation already exists, skipping duplicate creation');
+              return prev;
+            }
+
+            console.log('[Chat] Creating new conversation with message:', newMessage.id);
             return [...prev, newConversation];
           }
         });
-        console.log('✅ Conversation state updated');
+        console.log('[websocket] Message processing complete');
+        
+        // Auto-select the conversation if it's not currently active
+        if (data.conversationId !== activeConversationId) {
+          console.log('[Chat] Auto-selecting conversation:', data.conversationId);
+          setActiveConversationId(data.conversationId);
+        }
       } catch (err) {
-        console.error('❌ Error handling incoming message:', err);
+        console.error('[websocket] Message processing failed:', err);
         // ❌ Report decryption failure (NACK)
         try {
           const reason = err instanceof Error ? err.message : 'Unknown error';
-          await apiClient.reportMessageFailure(data.messageId, reason);
-          console.log('📤 NACK sent for failed message');
+          console.log('[websocket] Sending NACK:', reason);
+          realtimeClient.reportMessageFailure(data.messageId, reason);
         } catch (nackErr) {
-          console.error('⚠️ Failed to send NACK:', nackErr);
+          console.error('[websocket] NACK failed:', nackErr);
         }
       }
     };
@@ -459,16 +538,26 @@ export default function Chat() {
       groupName?: string;
       createdAt: string;
     }) => {
-      // Add to pending requests list
-      setPendingRequests((prev) => [
-        ...prev,
-        {
+      console.log('[Chat] Received conversation request via WebSocket:', data);
+
+      // Check if this request is already in pendingRequests to prevent duplicates
+      setPendingRequests((prev) => {
+        const exists = prev.some(req => req.convId === data.convId);
+        if (exists) {
+          console.log('[Chat] Ignoring duplicate conversation request', data.convId);
+          return prev;
+        }
+
+        const newRequest = {
           convId: data.convId,
           initiatorUserId: data.initiatorUserId,
           initiatorUsername: data.initiatorUsername,
           createdAt: data.createdAt,
-        },
-      ]);
+        };
+
+        console.log('[Chat] Adding new conversation request to pending list', newRequest);
+        return [...prev, newRequest];
+      });
 
       // Show notification badge on Requests tab
       if (view === 'chats') {
@@ -487,29 +576,35 @@ export default function Chat() {
       acceptedBy: string;
       acceptedByUsername: string;
     }) => {
-      // Initialize session for Alice (she will send first message with ephemeral key)
-      try {
-        await messagingService.initializeSessionAfterAccept(
-          data.convId,
-          data.acceptedBy,
-          data.acceptedByUsername
-        );
-        
-        // Update conversation status from 'pending' to 'accepted'
-        setConversations((prev) =>
-          prev.map((c) =>
-            c.id === data.convId
-              ? { ...c, status: 'accepted' }
-              : c
-          )
-        );
-      } catch (err) {
+      console.log('[Chat] Conversation accepted', data);
+
+      // Update conversation status from 'pending' to 'accepted'
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === data.convId
+            ? { ...c, status: 'accepted' as const }
+            : c
+        )
+      );
+
+      // If this is our request that was accepted, initialize session for sending first message
+      const conversation = conversations.find(c => c.id === data.convId);
+      if (conversation && data.acceptedBy !== currentUser.id) {
+        try {
+          await messagingService.initializeSessionAfterAccept(
+            data.convId,
+            data.acceptedBy,
+            data.acceptedByUsername
+          );
+        } catch (err) {
+          console.error('[Chat] Failed to initialize session after acceptance:', err);
+        }
       }
     };
 
     const unsubscribe = realtimeClient.onConversationAccepted(handleConversationAccepted);
     return () => unsubscribe();
-  }, []);
+  }, [conversations]);
 
   // Handle user search
   const handleSearch = async (query: string) => {
@@ -536,15 +631,31 @@ export default function Chat() {
     try {
       // Check if conversation already exists
       const existing = conversations.find((c) => c.partnerId === user.id);
+      // If an existing conversation is found but we don't have a local session for it,
+      // treat it as if it doesn't exist so the user can start a fresh secure session.
       if (existing) {
-        setActiveConversationId(existing.id);
-        setSearchQuery('');
-        setSearchResults([]);
-        return;
+        if (messagingService.hasSession(existing.id)) {
+          setActiveConversationId(existing.id);
+          setSearchQuery('');
+          setSearchResults([]);
+          return;
+        }
+        // Otherwise fallthrough and create a new conversation to re-establish keys
       }
 
       // Send conversation request (NO session created yet)
       const conversationId = await messagingService.sendConversationRequest(user.id, user.username);
+
+      // Check if this conversation ID already exists in our conversations list
+      // This can happen if the backend returned an existing conversation
+      const existingConversation = conversations.find((c) => c.id === conversationId);
+      if (existingConversation) {
+        console.log('[startConversation] Switching to existing conversation', conversationId);
+        setActiveConversationId(conversationId);
+        setSearchQuery('');
+        setSearchResults([]);
+        return;
+      }
 
       const newConversation: Conversation = {
         id: conversationId,
@@ -568,12 +679,13 @@ export default function Chat() {
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!messageInput.trim() || !activeConversationId || sending) {
+    if (!messageInput.trim() || !activeConversationId || sendingRef.current) {
       return;
     }
 
     const content = messageInput.trim();
     setMessageInput('');
+    sendingRef.current = true;
     setSending(true);
 
     try {
@@ -589,30 +701,48 @@ export default function Chat() {
       // 2. WebSocket was delayed/failed, but conversation was actually accepted on backend
       if (!messagingService.hasSession(activeConversationId)) {
         try {
+          console.log('[sendMessage] Initializing session for conversation', activeConversationId);
           await messagingService.initializeSessionAfterAccept(
             activeConversationId,
             activeConv.partnerId,
             activeConv.partnerUsername
           );
+          console.log('[sendMessage] Session initialized successfully');
+
           // Update local status to 'accepted' now that we have a session
           setConversations((prev) =>
             prev.map((c) =>
               c.id === activeConversationId
-                ? { ...c, status: 'accepted' }
+                ? { ...c, status: 'accepted' as const }
                 : c
             )
           );
         } catch (sessionErr: any) {
-          // If we can't initialize session, conversation might not be accepted yet
-          if (sessionErr.message?.includes('no registered devices')) {
-            throw new Error('The recipient has not set up their encryption keys yet. Please ask them to sign in.');
+          console.error('[sendMessage] Session initialization failed:', sessionErr);
+
+          // If we can't initialize session, check if conversation might actually be accepted
+          // by trying to fetch the latest conversation data
+          try {
+            const latestConv = await apiClient.getConversation(activeConversationId);
+            if (latestConv && latestConv.memberUserIds.includes(currentUser.id)) {
+              // Conversation exists and we're a member, try sending anyway
+              // The session might be initializable on the next attempt
+              console.log('[sendMessage] Conversation exists, attempting to send without session');
+            } else {
+              throw new Error('Conversation not found or not a member');
+            }
+          } catch (convErr) {
+            console.error('[sendMessage] Conversation check failed:', convErr);
+            if (sessionErr.message?.includes('no registered devices')) {
+              throw new Error('The recipient has not set up their encryption keys yet. Please ask them to sign in.');
+            }
+            throw new Error('Unable to establish secure session. The recipient may not have accepted your request yet.');
           }
-          throw new Error('Unable to establish secure session. The recipient may not have accepted your request yet.');
         }
       }
 
       // Add temporary message
-      const tempId = `temp_${Date.now()}`;
+      const tempId = `temp_${crypto.randomUUID()}`;
       const tempMessage: Message = {
         id: tempId,
         senderId: currentUser.id,
@@ -665,6 +795,7 @@ export default function Chat() {
         )
       );
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   };
@@ -686,18 +817,30 @@ export default function Chat() {
       // Remove from pending requests
       setPendingRequests(prev => prev.filter(r => r.convId !== convId));
       
-      // Add to conversations list
-      setConversations(prev => [
-        ...prev,
-        {
-          id: convId,
-          partnerId: request.initiatorUserId,
-          partnerUsername: initiatorUsername,
-          messages: [],
-          unreadCount: 0,
-          status: 'accepted', // Mark as accepted
-        },
-      ]);
+      // Add to conversations list (only if it doesn't already exist)
+      setConversations(prev => {
+        const conversationExists = prev.some((c) => c.id === convId);
+        if (conversationExists) {
+          console.log('[accept] Conversation already exists, skipping duplicate creation');
+          return prev;
+        }
+
+        return [
+          ...prev,
+          {
+            id: convId,
+            partnerId: request.initiatorUserId,
+            partnerUsername: initiatorUsername,
+            messages: [],
+            unreadCount: 0,
+            status: 'accepted', // Mark as accepted
+          },
+        ];
+      });
+
+      // Join the conversation room
+      realtimeClient.joinConversation(convId);
+      console.log('[accept] Joined conversation room after accepting:', convId);
     } catch (err) {
       alert('Failed to accept conversation request');
     }
@@ -716,6 +859,13 @@ export default function Chat() {
   };
 
   const handleLogout = () => {
+    // Clear messaging sessions
+    messagingService.getAllSessions().forEach(session => {
+      messagingService.deleteSession(session.conversationId);
+    });
+    // Clear processed message IDs
+    setProcessedMessageIds(new Set());
+    processedMessageIdsRef.current.clear();
     localStorage.clear();
     navigate('/');
   };
@@ -901,6 +1051,46 @@ export default function Chat() {
         {/* Logout Button */}
         <div className="p-4 border-t border-green-500/20 space-y-2">
           <button
+            onClick={async () => {
+              try {
+                // Clear conversations from backend (development only)
+                await apiClient.clearConversations();
+                
+                // Clear all messaging sessions
+                messagingService.getAllSessions().forEach(session => {
+                  messagingService.deleteSession(session.conversationId);
+                });
+                // Clear conversations from state
+                setConversations([]);
+                // Clear session data from localStorage (but keep user auth)
+                const keysToRemove = Object.keys(localStorage).filter(key => key.startsWith('session_'));
+                keysToRemove.forEach(key => localStorage.removeItem(key));
+                // Clear processed message IDs
+                setProcessedMessageIds(new Set());
+                processedMessageIdsRef.current.clear();
+                alert('All conversations and sessions cleared from backend and frontend.');
+              } catch (err) {
+                // Fallback to frontend-only clearing if backend clear fails
+                // Clear all messaging sessions
+                messagingService.getAllSessions().forEach(session => {
+                  messagingService.deleteSession(session.conversationId);
+                });
+                // Clear conversations from state
+                setConversations([]);
+                // Clear session data from localStorage (but keep user auth)
+                const keysToRemove = Object.keys(localStorage).filter(key => key.startsWith('session_'));
+                keysToRemove.forEach(key => localStorage.removeItem(key));
+                // Clear processed message IDs
+                setProcessedMessageIds(new Set());
+                processedMessageIdsRef.current.clear();
+                alert('Backend clear failed, cleared sessions from frontend only. Conversations may persist on refresh.');
+              }
+            }}
+            className="w-full py-2 bg-yellow-500/20 hover:bg-yellow-500/30 border border-yellow-500 text-yellow-400 rounded font-mono text-sm transition-all"
+          >
+            CLEAR ALL DATA
+          </button>
+          <button
             onClick={() => navigate('/')}
             className="w-full py-2 bg-green-950/30 hover:bg-green-950/50 border border-green-500/30 hover:border-green-500 text-green-400 rounded font-mono text-sm transition-all"
           >
@@ -927,39 +1117,36 @@ export default function Chat() {
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {activeConversation.messages.map((msg) => {
-                const isMe = msg.senderId === currentUser?.id;
-                return (
+              {activeConversation.messages
+                .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+                .map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`flex ${msg.senderId === currentUser?.id ? 'justify-end' : 'justify-start'}`}
+                >
                   <div
-                    key={msg.id}
-                    className={`flex w-full ${isMe ? 'justify-end' : 'justify-start'}`}
+                    className={`max-w-[70%] rounded p-3 ${
+                      msg.senderId === currentUser?.id
+                        ? 'bg-green-500/20 border border-green-500/30'
+                        : 'bg-green-950/30 border border-green-500/20'
+                    }`}
                   >
-                    <div
-                      className={`max-w-[70%] rounded-lg p-3 shadow-md font-mono transition-all
-                        bg-zinc-900/80 border border-green-900/40 text-green-200 rounded-bl-none
-                      `}
-                      style={{
-                        borderTopRightRadius: isMe ? 0 : undefined,
-                        borderTopLeftRadius: !isMe ? 0 : undefined,
-                      }}
-                    >
-                      <div className="text-sm break-words">{msg.plaintext}</div>
-                      <div className="text-xs text-green-500/60 mt-2 flex items-center justify-between">
-                        <span>{msg.timestamp.toLocaleTimeString()}</span>
-                        {isMe && (
-                          <span className="ml-2">
-                            {msg.status === 'sending' && '⏳'}
-                            {msg.status === 'sent' && '✓'}
-                            {msg.status === 'delivered' && '✓✓'}
-                            {msg.status === 'read' && '✓✓✓'}
-                            {msg.status === 'failed' && '❌'}
-                          </span>
-                        )}
-                      </div>
+                    <div className="text-sm text-green-400 font-mono">{msg.plaintext}</div>
+                    <div className="text-xs text-green-500/60 mt-2 flex items-center justify-between font-mono">
+                      <span>{msg.timestamp.toLocaleTimeString()}</span>
+                      {msg.senderId === currentUser?.id && (
+                        <span className="ml-2">
+                          {msg.status === 'sending' && '⏳'}
+                          {msg.status === 'sent' && '✓'}
+                          {msg.status === 'delivered' && '✓✓'}
+                          {msg.status === 'read' && '✓✓✓'}
+                          {msg.status === 'failed' && '❌'}
+                        </span>
+                      )}
                     </div>
                   </div>
-                );
-              })}
+                </div>
+              ))}
             </div>
 
             {/* Message Input */}

@@ -60,7 +60,7 @@ const userSchema = new Schema<IUser>(
 );
 
 // Indexes
-userSchema.index({ username: 1 });
-userSchema.index({ identityPublicKey: 1 });
+// Note: username and identityPublicKey are already indexed due to unique: true constraint
+// No additional indexes needed
 
 export const User = model<IUser>('User', userSchema);

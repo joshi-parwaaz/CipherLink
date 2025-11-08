@@ -5,10 +5,6 @@ import { connectToMongo } from './config/mongo.js';
 import { initGridFS } from './services/attachments.service.js';
 import { config } from './config/index.js';
 import logger from './utils/logger.js';
-import { Server as SocketIOServer } from 'socket.io';
-
-// Export io instance for use in routes
-export let io: SocketIOServer;
 
 async function start() {
   try {
@@ -21,7 +17,7 @@ async function start() {
     // Create Express app
     const app = createApp();
     const httpServer = http.createServer(app);
-    io = setupSocket(httpServer);
+    setupSocket(httpServer);
 
     httpServer.listen(config.port, () => {
       logger.info(`🚀 CypherText backend listening on port ${config.port}`);

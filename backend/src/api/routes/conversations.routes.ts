@@ -5,7 +5,7 @@ import { Device } from '../../models/Device.js';
 import { User } from '../../models/User.js';
 import logger from '../../utils/logger.js';
 import { authenticate } from '../middleware/auth.js';
-import { io } from '../../index.js';
+import { io } from '../../realtime/socket.js';
 
 const router = express.Router();
 
@@ -39,6 +39,38 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
     if (existing) {
       res.status(409).json({ error: 'Conversation already exists' });
       return;
+    }
+
+    // For one_to_one conversations, check if a conversation already exists between these users
+    if (validatedData.type === 'one_to_one') {
+      const existingConversation = await Conversation.findOne({
+        type: 'one_to_one',
+        memberUserIds: { $all: validatedData.memberUserIds, $size: 2 },
+        status: { $in: ['pending', 'accepted'] } // Don't allow new conversations if there's already an active one
+      });
+
+      if (existingConversation) {
+        logger.warn(
+          {
+            existingConvId: existingConversation.convId,
+            existingStatus: existingConversation.status,
+            requestedConvId: validatedData.convId,
+            memberUserIds: validatedData.memberUserIds,
+          },
+          'Attempted to create duplicate one-to-one conversation, returning existing'
+        );
+        res.status(200).json({
+          convId: existingConversation.convId,
+          type: existingConversation.type,
+          memberUserIds: existingConversation.memberUserIds,
+          memberDeviceIds: existingConversation.memberDeviceIds,
+          groupName: existingConversation.groupName,
+          status: existingConversation.status,
+          createdAt: existingConversation.createdAt,
+          message: 'Existing conversation returned'
+        });
+        return;
+      }
     }
 
     // Validate one_to_one has exactly 2 members
@@ -84,7 +116,9 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
     const otherMembers = validatedData.memberUserIds.filter(id => id !== req.user!.userId);
     logger.info({ otherMembers, convId: conversation.convId }, 'Notifying other members of conversation request');
     otherMembers.forEach(userId => {
-      logger.info({ userId, room: `user:${userId}` }, 'Emitting conversationRequest to room');
+      logger.info({ userId, room: `user:${userId}`, convId: conversation.convId }, 'Emitting conversationRequest to room');
+      const room = io.sockets.adapter.rooms.get(`user:${userId}`);
+      logger.info({ userId, roomExists: !!room, roomSize: room ? room.size : 0 }, 'Room status before emit');
       io.to(`user:${userId}`).emit('conversationRequest', {
         convId: conversation.convId,
         type: conversation.type,
@@ -93,6 +127,7 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
         groupName: conversation.groupName,
         createdAt: conversation.createdAt,
       });
+      logger.info({ userId, convId: conversation.convId }, 'ConversationRequest emitted');
     });
 
     res.status(201).json({
@@ -151,19 +186,62 @@ router.get('/:convId', async (req: AuthRequest, res: Response): Promise<void> =>
 // GET /api/conversations - List user's conversations
 router.get('/', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const conversations = await Conversation.find({
+    // Get all conversations for the user
+    const allConversations = await Conversation.find({
       memberUserIds: req.user!.userId,
     })
-      .sort({ lastMessageAt: -1 })
-      .limit(100);
+      .sort({ lastMessageAt: -1, createdAt: -1 })
+      .limit(200); // Get more to allow for deduplication
+
+    // Deduplicate one-to-one conversations - only keep the most recent active conversation per user pair
+    const conversationMap = new Map<string, any>();
+    const processedPairs = new Set<string>();
+
+    for (const conv of allConversations) {
+      if (conv.type === 'one_to_one') {
+        // Create a unique key for the user pair (sorted to ensure consistency)
+        const userPair = conv.memberUserIds.sort().join('-');
+
+        // Skip if we've already processed this user pair
+        if (processedPairs.has(userPair)) {
+          logger.info({
+            convId: conv.convId,
+            userPair,
+            status: conv.status,
+            createdAt: conv.createdAt
+          }, 'Skipping duplicate one-to-one conversation');
+          continue;
+        }
+
+        // Mark this pair as processed
+        processedPairs.add(userPair);
+      }
+
+      // Add conversation to result map
+      conversationMap.set(conv.convId, conv);
+    }
+
+    // Convert map to array and sort by lastMessageAt
+    const conversations = Array.from(conversationMap.values())
+      .sort((a, b) => {
+        // Sort by lastMessageAt (most recent first), then by createdAt
+        if (a.lastMessageAt && b.lastMessageAt) {
+          return new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime();
+        }
+        if (a.lastMessageAt && !b.lastMessageAt) return -1;
+        if (!a.lastMessageAt && b.lastMessageAt) return 1;
+        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      })
+      .slice(0, 100); // Limit to 100 conversations
+
+    logger.info({
+      totalFound: allConversations.length,
+      afterDeduplication: conversations.length,
+      userId: req.user!.userId
+    }, 'Conversation list deduplicated');
 
     res.json({
       conversations: conversations.map((c) => {
-        logger.info({ 
-          convId: c.convId, 
-          memberUserIds: c.memberUserIds,
-          memberUserIdsTypes: c.memberUserIds.map(id => typeof id),
-        }, 'Sending conversation to frontend');
         return {
           convId: c.convId,
           type: c.type,
@@ -185,20 +263,25 @@ router.get('/', async (req: AuthRequest, res: Response): Promise<void> => {
 // GET /api/conversations/pending - List pending conversation requests for current user
 router.get('/requests/pending', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const userId = req.user!.userId;
+    logger.info({ userId }, 'Fetching pending conversation requests');
+
     // Find conversations where user is a member but status is 'pending' and user is NOT the initiator
     const pendingRequests = await Conversation.find({
-      memberUserIds: req.user!.userId,
+      memberUserIds: userId,
       status: 'pending',
-      initiatorUserId: { $ne: req.user!.userId }, // Not initiated by current user
+      initiatorUserId: { $ne: userId }, // Not initiated by current user
     })
       .sort({ createdAt: -1 })
       .limit(50);
+
+    logger.info({ userId, count: pendingRequests.length }, 'Found pending requests in database');
 
     // Fetch initiator usernames
     const conversationsWithInitiator = await Promise.all(
       pendingRequests.map(async (conv) => {
         const initiatorUser = await User.findById(conv.initiatorUserId).select('username');
-        return {
+        const result = {
           convId: conv.convId,
           type: conv.type,
           initiatorUserId: conv.initiatorUserId,
@@ -206,8 +289,12 @@ router.get('/requests/pending', async (req: AuthRequest, res: Response): Promise
           groupName: conv.groupName,
           createdAt: conv.createdAt,
         };
+        logger.info({ userId, convId: conv.convId, initiatorUsername: result.initiatorUsername }, 'Pending request details');
+        return result;
       })
     );
+
+    logger.info({ userId, finalCount: conversationsWithInitiator.length }, 'Returning pending requests');
 
     res.json({
       pending: conversationsWithInitiator,
@@ -384,6 +471,37 @@ router.post('/:convId/reject', async (req: AuthRequest, res: Response): Promise<
   } catch (error) {
     logger.error(error, 'Failed to reject conversation');
     res.status(500).json({ error: 'Failed to reject conversation' });
+  }
+});
+
+// DELETE /api/conversations - Clear all conversations for current user (for testing/debugging)
+router.delete('/', async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    // Only allow in development mode for safety
+    if (process.env.NODE_ENV !== 'development') {
+      res.status(403).json({ error: 'This endpoint is only available in development mode' });
+      return;
+    }
+
+    const result = await Conversation.deleteMany({
+      memberUserIds: req.user!.userId,
+    });
+
+    logger.warn(
+      {
+        userId: req.user!.userId,
+        deletedCount: result.deletedCount,
+      },
+      'All conversations cleared for user (development only)'
+    );
+
+    res.json({
+      message: `Cleared ${result.deletedCount} conversations`,
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    logger.error(error, 'Failed to clear conversations');
+    res.status(500).json({ error: 'Failed to clear conversations' });
   }
 });
 

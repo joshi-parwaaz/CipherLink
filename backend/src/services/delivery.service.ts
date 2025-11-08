@@ -1,6 +1,8 @@
 import { Message, IMessage } from '../models/Message.js';
+import { Conversation } from '../models/Conversation.js';
 import logger from '../utils/logger.js';
-import { io } from '../index.js'; // WebSocket instance
+import { io } from '../realtime/socket.js'; // WebSocket instance
+import { pushRecentLog } from '../utils/recentLogs.js';
 
 export interface MessageEnvelope {
   messageId: string; // UUID/nanoid
@@ -76,32 +78,52 @@ export async function deliverMessage(
     },
     'Message saved'
   );
-
-  // Emit WebSocket event to each recipient device
-  envelope.toDeviceIds.forEach((deviceId) => {
-    const room = `device:${deviceId}`;
-    logger.info(
-      { deviceId, room, messageId: message.messageId },
-      'Attempting to emit message:new to room'
-    );
-    
-    io?.to(room).emit('message:new', {
+  try {
+    pushRecentLog('info', 'Message saved', {
       messageId: message.messageId,
       convId: message.convId,
-      fromUserId: message.fromUserId,
-      fromDeviceId: message.fromDeviceId,
-      ciphertext: message.ciphertext,
-      nonce: message.nonce,
-      aad: message.aad,
-      messageNumber: message.messageNumber,
-      sentAt: message.sentAt,
       serverReceivedAt: message.serverReceivedAt,
+      status: message.status,
     });
-    
-    logger.info(
-      { deviceId, messageId: message.messageId },
-      'WebSocket message:new emitted'
-    );
+  } catch (err) {}
+
+  // Emit WebSocket event to recipient users (not devices, to handle multi-device)
+  // Get conversation to find all members
+  const conversation = await Conversation.findOne({ convId: envelope.convId });
+  if (!conversation) {
+    throw new Error('Conversation not found for message delivery');
+  }
+
+  // Emit to all member users except the sender
+  conversation.memberUserIds.forEach((userId) => {
+    if (userId !== envelope.fromUserId) {
+      try {
+        // Inspect user room membership for diagnostics
+        const room = io?.sockets?.adapter?.rooms?.get(`user:${userId}`);
+        const count = room ? room.size : 0;
+        logger.info({ userId, socketsInRoom: count, messageId: message.messageId }, 'Emitting message to user room');
+        pushRecentLog('info', 'Emitting message to user room', { userId, socketsInRoom: count, messageId: message.messageId });
+
+        io?.to(`user:${userId}`).emit('message:new', {
+          messageId: message.messageId,
+          convId: message.convId,
+          fromUserId: message.fromUserId,
+          fromDeviceId: message.fromDeviceId,
+          ciphertext: message.ciphertext,
+          nonce: message.nonce,
+          aad: message.aad,
+          messageNumber: message.messageNumber,
+          sentAt: message.sentAt,
+          serverReceivedAt: message.serverReceivedAt,
+        });
+        logger.info({ userId, messageId: message.messageId }, 'WebSocket emit to user room executed');
+        try { pushRecentLog('info', 'WebSocket emit to user room executed', { userId, messageId: message.messageId }); } catch (err) {}
+      } catch (err) {
+        logger.warn({ err, userId, messageId: message.messageId }, 'Failed to emit to user room');
+      }
+    } else {
+      logger.debug({ userId: envelope.fromUserId, messageId: message.messageId }, 'Skipping emit to sender');
+    }
   });
 
   return message;

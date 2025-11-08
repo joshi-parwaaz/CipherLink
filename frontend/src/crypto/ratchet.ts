@@ -179,6 +179,9 @@ function dhRatchetStep(state: RatchetState, theirNewPublicKey: Uint8Array): void
   state.rootKey = sendingKdf.rootKey;
   state.sendingChainKey = sendingKdf.chainKey;
   state.sendingMessageNumber = 0;
+
+  // Clear skipped message keys as they become invalid after DH ratchet
+  state.skippedMessageKeys.clear();
 }
 
 /**
@@ -202,6 +205,28 @@ function skipMessageKeys(state: RatchetState, until: number): void {
 
     state.receivingChainKey = nextChainKey;
     state.receivingMessageNumber += 1;
+  }
+
+  // Limit the number of skipped keys to prevent memory leaks
+  limitSkippedMessageKeys(state);
+}
+
+/**
+ * Limit the number of skipped message keys to prevent memory leaks
+ */
+function limitSkippedMessageKeys(state: RatchetState): void {
+  const maxSkippedKeys = 200; // Allow up to 200 skipped keys
+
+  if (state.skippedMessageKeys.size > maxSkippedKeys) {
+    // Remove oldest keys (lowest message numbers)
+    const keysToRemove = state.skippedMessageKeys.size - maxSkippedKeys;
+    const sortedKeys = Array.from(state.skippedMessageKeys.keys()).sort();
+
+    for (let i = 0; i < keysToRemove; i++) {
+      state.skippedMessageKeys.delete(sortedKeys[i]);
+    }
+
+    console.warn(`[ratchet] Cleared ${keysToRemove} old skipped message keys to prevent memory leak`);
   }
 }
 
@@ -276,6 +301,51 @@ function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+/**
+ * Validate ratchet state for encryption operations
+ */
+export function validateRatchetStateForEncryption(state: RatchetState): void {
+  if (!state.rootKey || state.rootKey.length === 0) {
+    throw new Error('Invalid ratchet state: missing or empty root key');
+  }
+
+  if (!state.sendingChainKey || state.sendingChainKey.length === 0) {
+    throw new Error('Invalid ratchet state: missing or empty sending chain key');
+  }
+
+  if (!state.dhSendingKey || state.dhSendingKey.length === 0) {
+    throw new Error('Invalid ratchet state: missing or empty DH sending key');
+  }
+
+  if (state.sendingMessageNumber < 0) {
+    throw new Error('Invalid ratchet state: negative sending message number');
+  }
+
+  if (!state.skippedMessageKeys) {
+    throw new Error('Invalid ratchet state: missing skipped message keys map');
+  }
+}
+
+/**
+ * Validate ratchet state for decryption operations
+ */
+export function validateRatchetStateForDecryption(state: RatchetState): void {
+  if (!state.rootKey || state.rootKey.length === 0) {
+    throw new Error('Invalid ratchet state: missing or empty root key');
+  }
+
+  if (state.receivingMessageNumber < 0) {
+    throw new Error('Invalid ratchet state: negative receiving message number');
+  }
+
+  if (!state.skippedMessageKeys) {
+    throw new Error('Invalid ratchet state: missing skipped message keys map');
+  }
+
+  // Note: receivingChainKey may be undefined initially, but should be set after first DH ratchet
+  // dhReceivingKey may also be undefined initially
 }
 
 /**

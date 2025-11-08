@@ -5,14 +5,13 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from '@jest/globals';
 import request from 'supertest';
-import mongoose from 'mongoose';
 import { createApp } from '../../server.js';
 import { Device } from '../../../models/Device.js';
 import { User } from '../../../models/User.js';
 import jwt from 'jsonwebtoken';
 import { config } from '../../../config/index.js';
+import { clearTestDB, setupTestDB, teardownTestDB } from '../../../__tests__/test-setup.js';
 
-const TEST_DB = 'mongodb://localhost:27017/cyphertext-test';
 const app = createApp();
 
 let authToken: string;
@@ -20,18 +19,15 @@ let testUserId: string;
 let testDeviceId: string;
 
 beforeAll(async () => {
-  await mongoose.connect(TEST_DB);
-});
+  await setupTestDB();
+}, 30000);
 
 afterAll(async () => {
-  await mongoose.connection.dropDatabase();
-  await mongoose.disconnect();
-});
+  await teardownTestDB();
+}, 30000);
 
 beforeEach(async () => {
-  // Clear collections
-  await Device.deleteMany({});
-  await User.deleteMany({});
+  await clearTestDB();
 
   // Create test user
   testUserId = 'user-123';
@@ -61,7 +57,7 @@ beforeEach(async () => {
     config.jwtSecret,
     { expiresIn: '1h' }
   );
-});
+}, 15000);
 
 describe('POST /api/prekeys/upload', () => {
   it('should upload prekey bundle successfully', async () => {

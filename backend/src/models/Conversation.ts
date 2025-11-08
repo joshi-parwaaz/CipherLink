@@ -20,7 +20,6 @@ const conversationSchema = new Schema<IConversation>(
       type: String,
       required: true,
       unique: true,
-      index: true,
     },
     type: {
       type: String,
@@ -71,6 +70,12 @@ const conversationSchema = new Schema<IConversation>(
 conversationSchema.index({ memberUserIds: 1 });
 conversationSchema.index({ convId: 1 }, { unique: true });
 conversationSchema.index({ lastMessageAt: -1 });
+
+// Compound index for one-to-one conversations (uniqueness enforced in application logic)
+conversationSchema.index(
+  { type: 1, memberUserIds: 1 },
+  { name: 'one_to_one_conversations_index' }
+);
 
 // Ensure one_to_one conversations have exactly 2 members
 conversationSchema.pre('save', function (next) {

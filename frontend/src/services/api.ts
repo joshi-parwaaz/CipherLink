@@ -20,19 +20,39 @@ class APIClient {
 
     // Add token to requests
     this.client.interceptors.request.use((config) => {
-      if (this.token) {
-        config.headers.Authorization = `Bearer ${this.token}`;
+      // Ensure we have a token: prefer in-memory, fallback to localStorage
+      if (!this.token) {
+        const stored = localStorage.getItem('authToken');
+        if (stored) this.token = stored;
       }
+
+      if (this.token) {
+        // Use lowercase header name to match server checks (Express lowercases headers)
+        // and ensure we don't accidentally override other header objects
+        if (!config.headers) config.headers = {} as any;
+        (config.headers as any)['authorization'] = `Bearer ${this.token}`;
+      }
+
       return config;
     });
   }
 
   setToken(token: string): void {
     this.token = token;
+    try {
+      localStorage.setItem('authToken', token);
+    } catch (e) {
+      // ignore storage errors in restricted environments
+    }
   }
 
   clearToken(): void {
     this.token = null;
+    try {
+      localStorage.removeItem('authToken');
+    } catch (e) {
+      // ignore
+    }
   }
 
   // ========== Auth ==========
@@ -144,6 +164,7 @@ class APIClient {
     memberDeviceIds: string[];
     groupName?: string;
     createdAt: string;
+    message?: string; // May be present when returning existing conversation
   }> {
     const response = await this.client.post('/conversations', data);
     return response.data;
@@ -216,6 +237,16 @@ class APIClient {
     return response.data;
   }
 
+  // ========== Development/Debugging ==========
+
+  async clearConversations(): Promise<{
+    message: string;
+    deletedCount: number;
+  }> {
+    const response = await this.client.delete('/conversations');
+    return response.data;
+  }
+
   // ========== Messages (to be implemented in Phase 3) ==========
 
   async sendMessage(data: {
@@ -277,42 +308,6 @@ class APIClient {
 
   async reportMessageFailure(messageId: string, reason?: string): Promise<void> {
     await this.client.post('/messages/nack', { messageId, reason });
-  }
-
-  /**
-   * Get message history for a conversation (encrypted)
-   * Returns all messages (pending, delivered, etc.) for persistent history
-   */
-  async getConversationMessages(
-    convId: string,
-    limit: number = 100,
-    offset: number = 0
-  ): Promise<{
-    messages: Array<{
-      messageId: string;
-      convId: string;
-      fromUserId: string;
-      fromDeviceId: string;
-      ciphertext: string;
-      nonce: string;
-      aad: {
-        senderId: string;
-        recipientIds: string[];
-        ts: Date;
-      };
-      messageNumber?: number;
-      sentAt: Date;
-      serverReceivedAt: Date;
-      status: string;
-    }>;
-    total: number;
-    hasMore: boolean;
-  }> {
-    const response = await this.client.get(
-      `/messages/conversation/${convId}`,
-      { params: { limit, offset } }
-    );
-    return response.data;
   }
 
   // ========== Devices (to be implemented in Phase 4) ==========

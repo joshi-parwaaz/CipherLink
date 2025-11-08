@@ -5,7 +5,6 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from '@jest/globals';
 import request from 'supertest';
-import mongoose from 'mongoose';
 import { createApp } from '../../server.js';
 import { Message } from '../../../models/Message.js';
 import { User } from '../../../models/User.js';
@@ -13,8 +12,8 @@ import { Device } from '../../../models/Device.js';
 import { Conversation } from '../../../models/Conversation.js';
 import jwt from 'jsonwebtoken';
 import { config } from '../../../config/index.js';
+import { clearTestDB, setupTestDB, teardownTestDB } from '../../../__tests__/test-setup.js';
 
-const TEST_DB = 'mongodb://localhost:27017/cyphertext-test';
 const app = createApp();
 
 let senderToken: string;
@@ -26,20 +25,15 @@ let receiverDeviceId: string;
 let conversationId: string;
 
 beforeAll(async () => {
-  await mongoose.connect(TEST_DB);
+  await setupTestDB();
 });
 
 afterAll(async () => {
-  await mongoose.connection.dropDatabase();
-  await mongoose.disconnect();
+  await teardownTestDB();
 });
 
 beforeEach(async () => {
-  // Clear collections
-  await Message.deleteMany({});
-  await User.deleteMany({});
-  await Device.deleteMany({});
-  await Conversation.deleteMany({});
+  await clearTestDB();
 
   // Create sender
   senderId = 'sender-123';
@@ -101,6 +95,7 @@ beforeEach(async () => {
     convId: conversationId,
     type: 'one_to_one',
     memberUserIds: [senderId, receiverId],
+    memberDeviceIds: [senderDeviceId, receiverDeviceId],
     initiatorUserId: senderId,
     status: 'accepted',
     createdAt: new Date(),
@@ -108,9 +103,12 @@ beforeEach(async () => {
   await conversation.save();
 });
 
-describe('POST /api/messages', () => {
+describe('Message Delivery API', () => {
+  // Increase timeout for database operations
+  jest.setTimeout(10000);
   it('should send encrypted message successfully', async () => {
     const messageData = {
+      messageId: 'test-message-123',
       convId: conversationId,
       toDeviceIds: [receiverDeviceId],
       aad: {
@@ -120,6 +118,7 @@ describe('POST /api/messages', () => {
       },
       nonce: 'bm9uY2U=',
       ciphertext: 'ZW5jcnlwdGVkTWVzc2FnZQ==',
+      sentAt: new Date().toISOString(),
       messageNumber: 1,
     };
 
@@ -127,10 +126,10 @@ describe('POST /api/messages', () => {
       .post('/api/messages')
       .set('Authorization', `Bearer ${senderToken}`)
       .send(messageData)
-      .expect(200);
+      .expect(201);
 
-    expect(response.body.success).toBe(true);
     expect(response.body.messageId).toBeTruthy();
+    expect(response.body.serverReceivedAt).toBeTruthy();
 
     // Verify message in database
     const message = await Message.findOne({ messageId: response.body.messageId });
@@ -397,7 +396,7 @@ describe('GET /api/messages/pending', () => {
 
   it('should return only pending messages for device', async () => {
     const response = await request(app)
-      .get('/api/messages/pending')
+      .get(`/api/messages/pending/${receiverDeviceId}`)
       .set('Authorization', `Bearer ${receiverToken}`)
       .expect(200);
 
@@ -407,6 +406,6 @@ describe('GET /api/messages/pending', () => {
   });
 
   it('should reject request without authentication', async () => {
-    await request(app).get('/api/messages/pending').expect(401);
+    await request(app).get(`/api/messages/pending/${receiverDeviceId}`).expect(401);
   });
 });

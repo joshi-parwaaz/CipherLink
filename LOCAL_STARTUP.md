@@ -1,13 +1,4 @@
-
 # CipherLink - Local Startup Guide
-
-## Note on Meta/Config Folders
-
-- `.github/` – GitHub Actions, Copilot, and workflow configuration (ignored in .gitignore)
-- `.specify/` – Internal feature planning, scripts, and templates (ignored in .gitignore)
-- `.vscode/` – VS Code workspace settings (ignored in .gitignore except settings.json)
-
-These folders are ignored in version control for privacy and repo cleanliness.
 
 Complete step-by-step instructions to get CipherLink running on your local machine.
 
@@ -258,21 +249,6 @@ To test messaging, you need **two users**:
 - Alice can now type a message and click "Send"
 - Bob receives it in real-time
 - Both can send messages back and forth
-
-### Message History / Reload behavior
-
-- The client now fetches encrypted conversation history from the backend and decrypts it locally on chat initialization. This means that after a refresh, previously delivered messages will reappear if the local ratchet/session state is present.
-- If you cleared browser localStorage (sessions and keys) the client will not be able to decrypt history — use the `cipherlink` debug utilities to inspect or clear sessions.
-
-### Helpful dev utilities
-
-- In the browser console (development builds) you have `cipherlink` helpers:
-  - `cipherlink.showSessions()` – list stored sessions and ratchet info
-  - `cipherlink.clearSessions()` – removes session objects from localStorage
-  - `cipherlink.stats()` – fetches server-side message counts per session for debugging
-  - `cipherlink.version()` – show storage version
-
-These are intended for development/debugging only.
 
 ---
 

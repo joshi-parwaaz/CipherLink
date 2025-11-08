@@ -27,4 +27,9 @@ export default {
     '!src/**/*.d.ts',
     '!src/**/__tests__/**',
   ],
+  // Run tests serially to avoid database conflicts
+  maxWorkers: 1,
+  // Global setup and teardown for database management
+  globalSetup: '<rootDir>/src/__tests__/global-setup.ts',
+  globalTeardown: '<rootDir>/src/__tests__/global-teardown.ts',
 };

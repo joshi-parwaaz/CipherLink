@@ -1,181 +1,138 @@
-
 # CipherLink - Technical Documentation
-
-## Note on Meta/Config Folders
-
-- `.github/` – GitHub Actions, Copilot, and workflow configuration (ignored in .gitignore)
-- `.specify/` – Internal feature planning, scripts, and templates (ignored in .gitignore)
-- `.vscode/` – VS Code workspace settings (ignored in .gitignore except settings.json)
-
-These folders are ignored in version control for privacy and repo cleanliness.
 
 Comprehensive technical documentation of the CipherLink end-to-end encrypted messaging platform.
 
-## Table of Contents
+# CipherLink — Technical Documentation (Condensed)
 
-1. [Architecture Overview](#architecture-overview)
-2. [Cryptographic Implementation](#cryptographic-implementation)
-3. [Backend Architecture](#backend-architecture)
-4. [Frontend Architecture](#frontend-architecture)
-5. [Protocol Flow](#protocol-flow)
-6. [Data Models](#data-models)
-7. [API Reference](#api-reference)
-8. [Security Considerations](#security-considerations)
+This document summarizes the CipherLink architecture, encryption workflow (X3DH + Double Ratchet), message flow between frontend and backend, key modules, error handling/recovery, and deployment notes.
 
----
-
-## Architecture Overview
-
-CipherLink implements a **zero-knowledge architecture** where the server acts purely as a relay for encrypted data. All encryption and decryption happen client-side using libsodium.
-
-### High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Client (Browser)                         │
-│  ┌────────────────────────────────────────────────────┐     │
-│  │  React Frontend                                     │     │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────┐    │     │
-│  │  │  X3DH    │  │  Ratchet │  │  AEAD        │    │     │
-│  │  │  Engine  │→ │  Engine  │→ │  Encryption  │    │     │
-│  │  └──────────┘  └──────────┘  └──────────────┘    │     │
-│  │                                                     │     │
-│  │  localStorage: Keys, Sessions, Ratchet State      │     │
-│  └────────────────────────────────────────────────────┘     │
-└───────────────────────┬──────────────────────────────────────┘
-                        │ HTTPS + WebSocket
-                        │ (Encrypted Envelopes Only)
-┌───────────────────────▼──────────────────────────────────────┐
-│                   Server (Node.js)                            │
-│  ┌─────────────────────────────────────────────────────┐     │
-│  │  Express API + Socket.IO                            │     │
-│  │  - Message relay (ciphertext only)                  │     │
-│  │  - Prekey distribution                              │     │
-│  │  - Delivery receipts                                │     │
-│  │  - NO ACCESS to plaintext or private keys          │     │
-│  └─────────────────────────────────────────────────────┘     │
-│                          │                                    │
-│  ┌─────────────────────▼─────────────────────────────┐      │
-│  │  MongoDB                                           │      │
-│  │  - Encrypted message envelopes                    │      │
-│  │  - Public keys only                               │      │
-│  │  - Metadata (userIds, timestamps, status)         │      │
-│  └───────────────────────────────────────────────────┘      │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### Technology Stack
-
-**Frontend**
-- **Framework**: React 18 with TypeScript
-- **Build Tool**: Vite
-- **Styling**: TailwindCSS
-- **Cryptography**: libsodium-wrappers (NaCl)
-- **Real-time**: Socket.io-client
-- **HTTP Client**: Axios
-- **Routing**: React Router v6
-
-**Backend**
-- **Runtime**: Node.js v18+
-- **Framework**: Express
-- **Language**: TypeScript
-- **Database**: MongoDB + Mongoose ODM
-- **Real-time**: Socket.io
-- **Authentication**: JWT (jsonwebtoken)
-- **Password Hashing**: bcrypt
-- **Logging**: Pino
-- **File Storage**: GridFS (MongoDB)
+Contents
+- Architecture overview
+- Encryption workflow (X3DH + Double Ratchet)
+- Frontend ↔ Backend message flow
+- Key modules and purpose
+- Error handling & recovery
+- Setup & deployment summary
+- Further reading (source file references)
 
 ---
 
-## Cryptographic Implementation
+## 1. Architecture overview
 
-CipherLink implements the **Signal Protocol** cryptographic primitives using libsodium.
+CipherLink is a zero-knowledge messaging system: the server transports encrypted envelopes only. Clients manage identity keys, prekeys and ratchet state locally. Key decisions:
+- Client-side cryptography (libsodium)
+- Per-device sessions (one ratchet state per conversation-device pair)
+- WebSocket (Socket.IO) for real-time, HTTP polling as fallback
+- MongoDB stores ciphertext envelopes plus minimal metadata (no private keys)
 
-### Key Types
+High-level components
+- Frontend: React + TypeScript — key management, X3DH, Double Ratchet, UI
+- Backend: Node.js + Express — prekey distribution, message storage, delivery fan-out
+- Database: MongoDB (encrypted envelopes, prekey metadata, receipts)
 
-#### 1. Identity Keys (Long-term)
-- **Algorithm**: Ed25519 (signing)
-- **Purpose**: User identity, signing prekeys
-- **Storage**: 
-  - Public: MongoDB (hex)
-  - Private: localStorage encrypted with Argon2id-derived key
-- **Generation**: `crypto_sign_keypair()`
+---
 
-#### 2. Ephemeral Keys (Session)
-- **Algorithm**: X25519 (ECDH)
-- **Purpose**: X3DH handshake, DH ratchet
-- **Lifetime**: Single session
-- **Generation**: `crypto_box_keypair()` → `crypto_sign_ed25519_sk_to_curve25519()`
+## 2. Encryption workflow (X3DH + Double Ratchet)
 
-#### 3. Prekeys
-- **Signed Prekey**: X25519 public key signed with identity key
-- **One-time Prekeys**: Pool of X25519 keys consumed on first use
-- **Purpose**: Enable asynchronous session initiation
+X3DH: asynchronous session setup using signed prekeys and optional one-time prekeys.
+ - Initiator (Alice) fetches recipient's prekey bundle, verifies signed prekey signature, generates ephemeral key and computes DHs, derives shared secret via HKDF, then sends first message containing ephemeral public key.
+ - Responder (Bob) extracts ephemeral key from first message, computes matching DHs and derives the same shared secret.
 
-### X3DH (Extended Triple Diffie-Hellman)
+Double Ratchet: after X3DH, both parties initialize ratchets with the shared secret and ratchet public keys.
+ - Each message advances a symmetric chain producing a per-message key used with XChaCha20-Poly1305 AEAD.
+ - Ratchet headers include sender ratchet public key and message number to support out-of-order handling.
 
-**Implementation**: `frontend/src/crypto/x3dh.ts`
+Out-of-order messages
+ - Ciphertext headers + skipped-key cache allow decryption of messages arriving out of order.
+ - Max skipped keys configurable to limit memory.
 
-#### Protocol Steps
+Security primitives
+ - Identity: Ed25519 (signing)
+ - Agreement / Ratchet: X25519
+ - AEAD: XChaCha20-Poly1305
+ - KDF: HKDF (HMAC-SHA256)
+ - Local key protection: Argon2id
 
-**Alice (Initiator)**:
-1. Fetch Bob's prekey bundle (IK<sub>B</sub>, SPK<sub>B</sub>, OPK<sub>B</sub>)
-2. Verify SPK<sub>B</sub> signature
-3. Generate ephemeral key pair (EK<sub>A</sub>)
-4. Perform 4 DH operations:
-   - DH1 = DH(IK<sub>A</sub>, SPK<sub>B</sub>)
-   - DH2 = DH(EK<sub>A</sub>, IK<sub>B</sub>)
-   - DH3 = DH(EK<sub>A</sub>, SPK<sub>B</sub>)
-   - DH4 = DH(EK<sub>A</sub>, OPK<sub>B</sub>) *if OPK available*
-5. Derive shared secret: SK = HKDF(DH1 || DH2 || DH3 || DH4)
-6. Send EK<sub>A</sub> to Bob in first message
+---
 
-**Bob (Responder)**:
-1. Receive first message with EK<sub>A</sub>
-2. Perform same 4 DH operations (reversed perspective):
-   - DH1 = DH(SPK<sub>B</sub>, IK<sub>A</sub>)
-   - DH2 = DH(IK<sub>B</sub>, EK<sub>A</sub>)
-   - DH3 = DH(SPK<sub>B</sub>, EK<sub>A</sub>)
-   - DH4 = DH(OPK<sub>B</sub>, EK<sub>A</sub>) *if OPK was used*
-3. Derive same shared secret: SK
+## 3. Frontend ↔ Backend message flow
 
-**Key Functions**:
-```typescript
-// Alice initiates
-x3dhInitiate(ourIdentityKeyPair, theirBundle) → { sharedSecret, ephemeralPublicKey }
+Send path (client):
+1. Compose message → Messaging service encrypts using ratchet state
+2. First outbound message may include X3DH ephemeral key in `x3dhData`
+3. POST /api/messages (ciphertext envelope)
+4. Backend stores envelope and attempts real-time fan-out to recipient devices via Socket.IO; if device offline, message marked pending
 
-// Bob responds
-x3dhRespond(ourIdentityKeyPair, ourSignedPreKeyPrivate, theirIdentityKey, theirEphemeralKey, ourOneTimePreKeyPrivate?) → sharedSecret
-```
+Receive path (client):
+1. WebSocket `message:new` event (or polling GET /api/messages/pending/:deviceId)
+2. Client parses header; if X3DH data present and no session, uses it to initialize Bob-side ratchet
+3. Attempt decryption; on success send ACK (POST /api/messages/:id/ack)
+4. On failure, client may attempt automatic session resync logic or report NACK for analysis
 
-### Double Ratchet Algorithm
+Server responsibilities
+ - Store encrypted envelopes and minimal metadata
+ - Maintain device list for fan-out
+ - Mark delivered/failed via ACK/NACK endpoints
 
-**Implementation**: `frontend/src/crypto/ratchet.ts`
+---
 
-Provides **forward secrecy** and **break-in recovery** through continuous key rotation.
+## 4. Key modules and their purpose
 
-#### Ratchet State
+Frontend (src/)
+- `crypto/` — X3DH, ratchet, AEAD, key serialization
+- `services/messaging.ts` — session lifecycle, encrypt/decrypt pipeline, local persistence
+- `services/realtime.ts` — Socket.IO wrapper and event handling
+- `services/api.ts` — HTTP helpers, token injection
+- `storage.ts` — safe localStorage wrappers and migration helpers
 
-```typescript
-interface RatchetState {
-  rootKey: Uint8Array;              // KDF root
-  sendingChainKey: Uint8Array;      // Sending message chain
-  receivingChainKey: Uint8Array;    // Receiving message chain
-  dhSendingKey: Uint8Array;         // Our DH ratchet key
-  dhReceivingKey: Uint8Array;       // Their DH ratchet key
-  sendingMessageNumber: number;     // Counter for ordering
-  receivingMessageNumber: number;
-  skippedMessageKeys: Map<>;        // Out-of-order keys
-}
-```
+Backend (src/)
+- `api/routes/*` — endpoints for auth, prekeys, messages, receipts
+- `realtime/socket.ts` — device room management and emits
+- `models/*` — Mongoose schemas for users/devices/messages
+- `services/*` — prekey handling, delivery receipts, attachments
 
-#### Symmetric Initialization
+---
 
-Both Alice and Bob start with identical root keys derived from X3DH shared secret:
+## 5. Error handling and recovery
 
-```typescript
-// Alice (initiator)
+Client:
+- Decryption failures: increment local counter, attempt automatic resync (re-init X3DH if inbound X3DH present), limit retries and surface user-visible error if repeated
+- Session corruption: verify session integrity at load, remove and trigger fresh X3DH initiation if unrecoverable
+
+Server:
+- Validation errors: 400 responses, logged
+- Delivery: track pending messages and expose polling endpoint
+
+Operational monitoring
+- Structured logging server-side (Pino) and selective client-side diagnostics (tagged logs) to avoid sensitive data leakage
+
+---
+
+## 6. Setup & deployment summary
+
+Local development
+- Node.js v18+, MongoDB
+- `backend`: `npm install && npm run dev`
+- `frontend`: `npm install && npm run dev`
+
+Production notes
+- Serve frontend assets via CDN or static host; backend behind TLS with strict CORS
+- Use managed MongoDB with auth and network restrictions
+- Strong JWT secret and rotated prekeys; run dependency audits
+
+---
+
+## Further reading (source files)
+- Frontend messaging: `frontend/src/services/messaging.ts`
+- Crypto implementations: `frontend/src/crypto/x3dh.ts`, `frontend/src/crypto/ratchet.ts`, `frontend/src/crypto/aead.ts`
+- Realtime: `frontend/src/services/realtime.ts`, `backend/src/realtime/socket.ts`
+- Backend routes: `backend/src/api/routes/messages.routes.ts`, `backend/src/api/routes/prekeys.routes.ts`
+
+---
+
+Document maintained as a condensed reference. For full implementation details, consult the source files above.
+
+*** End Patch
 initializeRatchetAlice(x3dhSharedSecret, bobRatchetPublicKey)
   → Performs initial DH with Bob's ratchet key
   → Derives root key and sending chain
@@ -873,63 +830,6 @@ Fetch pending messages for device (polling).
 ```
 
 #### POST /api/messages/:messageId/ack
-#### GET /api/messages/conversation/:convId
-Get encrypted message history for a conversation.
-
-Auth: Required (JWT)
-
-Query params:
-- `limit` (number, optional) — maximum messages to return (default 100)
-- `offset` (number, optional) — pagination offset
-
-Response (200):
-```json
-{
-  "messages": [
-    {
-      "messageId": "uuid",
-      "convId": "uuid",
-      "fromUserId": "uuid",
-      "fromDeviceId": "uuid",
-      "ciphertext": "base64",
-      "nonce": "base64",
-      "aad": { /* senderId/recipientIds/ts */ },
-      "messageNumber": 1,
-      "sentAt": "...",
-      "serverReceivedAt": "...",
-      "status": "delivered"
-    }
-  ],
-  "total": 42,
-  "hasMore": false
-}
-```
-
-Notes:
-- The endpoint verifies the requesting user is a member of the conversation and that the messages returned are relevant to the requesting device (toDeviceIds/fromDeviceId match). Only ciphertext and metadata are returned; the server never has access to plaintext.
-- Use pagination for large histories.
-
-### Frontend: history API and chat loading
-
-- `apiClient.getConversationMessages(convId, limit?, offset?)` — new helper that calls the endpoint above and returns the encrypted messages object.
-- `Chat.tsx` now loads recent history after session initialization. For each conversation the client:
-  1. Calls `getConversationMessages()` to fetch encrypted envelopes
-  2. Calls `messagingService.receiveMessage()` for each envelope – this will attempt to decrypt using the stored ratchet state and skipped-message keys
-  3. Successful decrypts are inserted into the UI; failed decrypts are reported with a NACK and skipped
-
-### Ratchet persistence and skipped-message keys
-
-The Double Ratchet implementation persists `skippedMessageKeys` in the serialized ratchet state saved to localStorage. The serialization converts the Map of skipped keys into a stable array so keys survive page reloads. This enables decrypting already-delivered messages after a refresh as long as the session is present in localStorage.
-
-Key points:
-- `skippedMessageKeys` format: key = `"ratchetPublicKey:messageNumber"` → value = base64 message key
-- The ratchet state is saved as `session_${conversationId}` in localStorage; the app has a storage version key `cipherlink_storage_version` and will auto-clear sessions if the version mismatches to avoid incompatible state.
-
-### Optional: IndexedDB message cache
-
-An optional `messageCache` (IndexedDB via `idb`) was sketched to cache decrypted messages locally for performance. If enabled, the client can use cached plaintext for quick UI rendering and fall back to server fetch+decrypt for verification.
-
-Security note: IndexedDB stores plaintext on the client; if you enable a cache, consider encrypting the cache or clearing it on logout.
 Acknowledge message delivery.
 
 **Auth**: Required

@@ -1,3 +1,26 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.DS_Store
+*.log
+coverage/
+tmp/
+/.turbo
+.parcel-cache
+/.pnp
+/.pnp.js
+**/node_modules/
+/.idea
+.vscode
+*.tgz
+npm-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+package-lock.json
+/.cache
+
 # Dependencies
 node_modules/
 npm-debug.log*
@@ -52,9 +75,9 @@ Desktop.ini
 .Spotlight-V100
 .Trashes
 
-
-# Editor and meta/config folders
+# Editor directories and files
 .vscode/*
+!.vscode/extensions.json
 !.vscode/settings.json
 .idea/
 *.suo
@@ -63,8 +86,6 @@ Desktop.ini
 *.sln
 *.sw?
 *.code-workspace
-.github/
-.specify/
 
 # Testing
 coverage/

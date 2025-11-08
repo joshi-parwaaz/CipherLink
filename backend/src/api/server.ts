@@ -13,6 +13,7 @@ import receiptsRoutes from './routes/receipts.routes.js';
 import attachmentsRoutes from './routes/attachments.routes.js';
 import devicesRoutes from './routes/devices.routes.js';
 import prekeysRoutes from './routes/prekeys.routes.js';
+import recentLogs from '../utils/recentLogs.js';
 
 export function createApp(): Express {
   const app = express();
@@ -38,6 +39,14 @@ export function createApp(): Express {
   app.use('/api/attachments', attachmentsRoutes);
   app.use('/api/devices', devicesRoutes);
   app.use('/api/prekeys', prekeysRoutes);
+
+  // Debug: expose recent logs for easy copy/paste during local development
+  if (process.env.NODE_ENV === 'development') {
+    app.get('/debug/logs', (req, res) => {
+      const limit = parseInt(req.query.limit as string) || 200;
+      res.json({ logs: recentLogs.getRecentLogs(limit) });
+    });
+  }
 
   return app;
 }

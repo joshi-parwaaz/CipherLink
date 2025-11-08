@@ -58,7 +58,7 @@ const attachmentSchema = new Schema<IAttachment>(
 );
 
 // Indexes
-attachmentSchema.index({ gridFsFileId: 1 });
-attachmentSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 }); // TTL index
+// Note: gridFsFileId is already indexed due to unique: true constraint
+// expiresAt index is needed for TTL functionality
 
 export const Attachment = model<IAttachment>('Attachment', attachmentSchema);

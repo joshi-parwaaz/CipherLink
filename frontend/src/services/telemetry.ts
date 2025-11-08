@@ -41,6 +41,7 @@ class TelemetryService {
     // Log to console in development
     if (import.meta.env.DEV) {
       const emoji = this.getEmojiForLevel(level);
+      console.log(`${emoji} [${level.toUpperCase()}] ${category}:${action}`, metadata || '');
     }
   }
 

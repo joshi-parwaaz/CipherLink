@@ -59,40 +59,49 @@ class RealtimeClient {
     });
 
     this.socket.on('connect', () => {
-      console.log('✅ WebSocket connected');
-      // Register device to receive messages
-      const userId = localStorage.getItem('userId');
-      const deviceId = localStorage.getItem('deviceId');
-      
-      if (userId && deviceId) {
-        console.log('📡 Registering device:', { userId, deviceId });
-        this.socket?.emit('register', { userId, deviceId });
-      } else {
-        console.error('❌ Cannot register: missing userId or deviceId');
-      }
+      // Backend auto-registers authenticated connections
+      console.debug('[realtime] connected and auto-registered', { socketId: this.socket?.id });
+      console.log('[realtime] Websocket connected successfully');
       
       this.connectHandlers.forEach((handler) => handler());
     });
 
     this.socket.on('disconnect', () => {
+      // silent disconnect
       this.disconnectHandlers.forEach((handler) => handler());
     });
 
     this.socket.on('message:new', (data) => {
-      console.log('🔔 WebSocket received message:new event:', data);
-      // Map backend field names to frontend expectations
+      // The backend sends the ciphertext as the JSON string containing envelope and header
+      // We just need to map the field names to what the frontend expects
       const mappedData = {
         messageId: data.messageId,
         conversationId: data.convId,         // Backend sends "convId"
         senderId: data.fromUserId,            // Backend sends "fromUserId"
-        ciphertext: data.ciphertext,
-        nonce: data.nonce,                    // CRITICAL: needed for decryption
-        aad: data.aad,                        // CRITICAL: needed for decryption
-        messageNumber: data.messageNumber,    // CRITICAL: needed for ratchet
+        ciphertext: data.ciphertext,          // This is already the JSON string with envelope+header
         timestamp: data.serverReceivedAt,     // Backend sends "serverReceivedAt"
       };
-      console.log('📨 Mapped data:', mappedData);
-      console.log('👂 Active message handlers:', this.messageHandlers.size);
+      
+      console.log('[realtime:message:new] 📨 RECEIVED WebSocket message', {
+        messageId: mappedData.messageId,
+        conversationId: mappedData.conversationId,
+        senderId: mappedData.senderId,
+        serverReceivedAt: mappedData.timestamp,
+        ciphertextLength: mappedData.ciphertext.length,
+        socketId: this.socket?.id
+      });
+      
+      // Debug: log incoming message payload (non-sensitive fields)
+      try {
+        console.debug('[realtime] message:new received', {
+          messageId: mappedData.messageId,
+          conversationId: mappedData.conversationId,
+          from: mappedData.senderId,
+          serverReceivedAt: mappedData.timestamp,
+          ciphertextLength: mappedData.ciphertext.length,
+        });
+      } catch (err) {}
+
       this.messageHandlers.forEach((handler) => handler(mappedData));
     });
 
@@ -108,7 +117,8 @@ class RealtimeClient {
       this.conversationAcceptedHandlers.forEach((handler) => handler(data));
     });
 
-    this.socket.on('error', () => {
+    this.socket.on('error', (err) => {
+      console.error('[realtime] socket error', err);
       // Socket errors handled by disconnect event
     });
   }
@@ -168,6 +178,16 @@ class RealtimeClient {
 
   sendTypingIndicator(conversationId: string, isTyping: boolean): void {
     this.socket?.emit('typing', { conversationId, isTyping });
+  }
+
+  acknowledgeMessage(messageId: string): void {
+    console.log('[realtime:ack] ✅ SENDING ACK for message', { messageId, socketId: this.socket?.id });
+    this.socket?.emit('ack', { messageId });
+  }
+
+  reportMessageFailure(messageId: string, reason?: string): void {
+    console.log('[realtime:nack] ❌ SENDING NACK for message', { messageId, reason, socketId: this.socket?.id });
+    this.socket?.emit('nack', { messageId, reason });
   }
 }
 

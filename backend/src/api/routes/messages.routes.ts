@@ -9,8 +9,8 @@ import {
   markMessageFailed 
 } from '../../services/delivery.service.js';
 import { Conversation } from '../../models/Conversation.js';
-import { Message } from '../../models/Message.js';
 import logger from '../../utils/logger.js';
+import { pushRecentLog } from '../../utils/recentLogs.js';
 
 const router = Router();
 
@@ -63,8 +63,28 @@ router.post('/', validateBody(sendMessageSchema), async (req, res): Promise<void
       messageNumber,
     } = req.body;
 
+    // Debug: log incoming message send attempt (mask sensitive parts)
+    try {
+      logger.info({
+        messageId,
+        convId,
+        toDeviceCount: Array.isArray(toDeviceIds) ? toDeviceIds.length : 0,
+        fromUserId: userId,
+        fromDeviceId: deviceId,
+      }, 'Incoming send message request');
+      // Push to recent logs
+      try { pushRecentLog('info', 'Incoming send message request', { messageId, convId, toDeviceCount: Array.isArray(toDeviceIds) ? toDeviceIds.length : 0, fromUserId: userId, fromDeviceId: deviceId }); } catch (err) {}
+    } catch (err) {
+      // ignore logging errors
+    }
+
     // Validate conversation exists
     const conversation = await Conversation.findOne({ convId });
+    // Debug: log conversation device list
+    try {
+      logger.info({ convId, memberDeviceIds: conversation?.memberDeviceIds || [] }, 'Conversation device list at send-time');
+      try { pushRecentLog('info', 'Conversation device list at send-time', { convId, memberDeviceIds: conversation?.memberDeviceIds || [] }); } catch (err) {}
+    } catch (err) {}
     if (!conversation) {
       res.status(404).json({ error: 'Conversation not found' });
       return;
@@ -169,83 +189,12 @@ router.get('/pending/:deviceId', async (req, res): Promise<void> => {
         sentAt: m.sentAt,
         serverReceivedAt: m.serverReceivedAt,
         ttl: m.ttl,
+        status: m.status,
         messageNumber: m.messageNumber,
       })),
     });
   } catch (err) {
     logger.error({ err }, 'Get pending messages error');
-    res.status(500).json({ error: 'Failed to retrieve messages' });
-  }
-});
-
-/**
- * GET /api/messages/conversation/:convId
- * Get message history for a conversation (encrypted)
- * Returns all messages regardless of status for persistent history
- */
-router.get('/conversation/:convId', async (req, res): Promise<void> => {
-  try {
-    const { convId } = req.params;
-    const limit = parseInt(req.query.limit as string) || 100;
-    const offset = parseInt(req.query.offset as string) || 0;
-    
-    const userId = (req as any).user?.userId;
-    const deviceId = (req as any).user?.deviceId;
-
-    if (!userId || !deviceId) {
-      res.status(401).json({ error: 'Unauthorized' });
-      return;
-    }
-
-    // Verify user is member of conversation
-    const conversation = await Conversation.findOne({ convId });
-    if (!conversation) {
-      res.status(404).json({ error: 'Conversation not found' });
-      return;
-    }
-
-    if (!conversation.memberUserIds.includes(userId)) {
-      res.status(403).json({ error: 'Not a member of this conversation' });
-      return;
-    }
-
-    // Fetch messages for this conversation
-    // Include messages TO this device or FROM this device
-    const messages = await Message.find({
-      convId,
-      $or: [
-        { toDeviceIds: deviceId },
-        { fromDeviceId: deviceId }
-      ]
-    })
-      .sort({ serverReceivedAt: 1 })
-      .skip(offset)
-      .limit(limit);
-
-    res.json({
-      messages: messages.map((m) => ({
-        messageId: m.messageId,
-        convId: m.convId,
-        fromUserId: m.fromUserId,
-        fromDeviceId: m.fromDeviceId,
-        ciphertext: m.ciphertext,
-        nonce: m.nonce,
-        aad: m.aad,
-        messageNumber: m.messageNumber,
-        sentAt: m.sentAt,
-        serverReceivedAt: m.serverReceivedAt,
-        status: m.status
-      })),
-      total: messages.length,
-      hasMore: messages.length === limit
-    });
-
-    logger.info(
-      { convId, userId, count: messages.length },
-      'Conversation history fetched'
-    );
-  } catch (err) {
-    logger.error({ err }, 'Get conversation messages error');
     res.status(500).json({ error: 'Failed to retrieve messages' });
   }
 });
