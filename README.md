@@ -40,6 +40,10 @@ cd frontend; npm install; cd ../backend; npm install
 # copy example env and edit values
 cp .env.example backend/.env
 
+# generate a secure JWT secret (required)
+cd backend
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
 # start backend (in one terminal)
 cd backend; npm run dev
 
